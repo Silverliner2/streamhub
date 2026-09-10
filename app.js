@@ -142,6 +142,7 @@ function playHlsDirect(url) {
 const TOP_CURATED = [
   { login: 'xqc', game: 'Just Chatting' },
   { login: 'shroud', game: 'Counter-Strike' },
+  { login: 'theburntpeanut', game: 'Grand Theft Auto V' },
   { login: 'ninja', game: 'Fortnite' },
   { login: 'tarik', game: 'VALORANT' },
   { login: 'asmongold', game: 'World of Warcraft' },
@@ -155,7 +156,7 @@ const TOP_CURATED = [
 ];
 const CATS = [
   { name: 'Just Chatting', streamers: ['xqc', 'hasanabi', 'pokimane', 'ludwig'] },
-  { name: 'Grand Theft Auto V', streamers: ['xqc', 'summit1g', 'buddha', 'shroud'] },
+  { name: 'Grand Theft Auto V', streamers: ['xqc', 'summit1g', 'buddha', 'shroud', 'theburntpeanut'] },
   { name: 'Counter-Strike', streamers: ['shroud', 'fl0m', 'ESL_CSGO'] },
   { name: 'World of Warcraft', streamers: ['asmongold', 'sodapoppin', 'esfandtv'] },
   { name: 'League of Legends', streamers: ['tyler1', 'riotgames', 'doublelift'] },
@@ -242,6 +243,23 @@ async function twitchGqlGames(query) {
     return edges.map((e) => e.item).filter((g) => g && g.name)
       .map((g) => ({ name: g.name, art: g.boxArtURL || twitchBoxArt(g.name) }));
   } finally { clearTimeout(t); }
+}
+
+/* Keyless live check (public DecAPI, CORS-open). Returns
+ * { loginLower: true/false }; missing entries = unknown. */
+async function twitchLiveCheck(logins) {
+  const out = {};
+  await Promise.all(logins.map(async (login) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const r = await fetch(`https://decapi.me/twitch/uptime/${encodeURIComponent(login)}`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) return;
+      out[login.toLowerCase()] = !/offline/i.test(await r.text());
+    } catch { clearTimeout(t); }
+  }));
+  return out;
 }
 
 async function twitchIvrLookup(login) {
@@ -396,10 +414,13 @@ async function loadTwitchDirectory() {
     }
   } catch { /* fall through to curated */ }
   hint.style.display = 'block';
-  hint.innerHTML = '<strong>Browse picks</strong> (no login needed — tap anything). Titles, live badges and viewer counts appear when you add a free Twitch Client-ID + token in ⚙ Settings.';
-  const items = TOP_CURATED.map((t) => ({
+  hint.innerHTML = '<strong>Browse picks</strong> (no login needed — tap anything). Top streams shows channels that are live right now. Titles, viewer counts and full live search appear when you add a free Twitch Client-ID + token in ⚙ Settings.';
+  const status = await twitchLiveCheck(TOP_CURATED.map((t) => t.login));
+  const known = TOP_CURATED.filter((t) => status[t.login.toLowerCase()] === true);
+  const pool = known.length ? known : TOP_CURATED;
+  const items = pool.map((t) => ({
     login: t.login, name: t.login, title: `Watch ${t.login}`, game: t.game,
-    viewers: null, live: false, thumb: twitchThumb(t.login),
+    viewers: null, live: status[t.login.toLowerCase()] === true, thumb: twitchThumb(t.login),
     hero: `https://static-cdn.jtvnw.net/previews-ttv/live_user_${encodeURIComponent(t.login.toLowerCase())}-1280x720.jpg`,
   }));
   renderHero(items[0]);
@@ -442,9 +463,12 @@ async function openCategory(gameName) {
     grid.innerHTML = `<div class="hint">No offline picks for <strong>${escapeHtml(gameName)}</strong> — add a free Twitch Client-ID + token in ⚙ Settings for live streams in every game.</div>`;
     return;
   }
-  renderStreamCards(logins.map((login) => ({
+  const status = await twitchLiveCheck(logins);
+  const ordered = [...logins].sort((a, b) =>
+    (status[b.toLowerCase()] === true ? 1 : 0) - (status[a.toLowerCase()] === true ? 1 : 0));
+  renderStreamCards(ordered.map((login) => ({
     login, name: login, title: `Watch ${login}`, game: gameName,
-    viewers: null, live: false, thumb: twitchThumb(login),
+    viewers: null, live: status[login.toLowerCase()] === true, thumb: twitchThumb(login),
   })), grid);
 }
 
