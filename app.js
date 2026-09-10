@@ -719,7 +719,7 @@ function currentPlaylist() {
   return iptvPlaylists.find((p) => p.id === openPlaylistId) || null;
 }
 
-async function fetchText(url, timeoutMs = 15000) {
+async function fetchText(url, timeoutMs = 20000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -731,29 +731,44 @@ async function fetchText(url, timeoutMs = 15000) {
 
 /* Browsers (Tesla included) block two things native apps like StrymTV
  * don't care about: cross-origin (CORS) reads and plain-http requests
- * from a secure page. So: try direct first, then https proxies which
- * fix both problems for the playlist download. */
+ * from a secure page. Strategy: try direct (original + https upgrade),
+ * then a chain of public https fallback routes. Free routes are flaky,
+ * so we try several and show progress instead of failing silently. */
 const CORS_PROXIES = [
   (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+  (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}`,
+  (u) => `https://r.jina.ai/${u}`,
 ];
 
-async function loadM3UFromUrl(url) {
-  try { return await fetchText(url); } catch { /* try proxies */ }
+async function loadM3UFromUrl(url, onStep) {
+  const say = (m) => { try { onStep && onStep(m); } catch {} };
+  const candidates = [url];
+  if (/^http:\/\//i.test(url)) {
+    const hv = url.replace(/^http:\/\//i, 'https://');
+    if (hv !== url) candidates.push(hv);
+  }
+  for (const c of candidates) {
+    try { say('Trying direct connection…'); return await fetchText(c); }
+    catch { /* next route */ }
+  }
+  let i = 0;
+  const total = CORS_PROXIES.length * candidates.length;
   for (const wrap of CORS_PROXIES) {
-    try {
-      const text = await fetchText(wrap(url));
-      if (text && /#EXTM3U/i.test(text)) return text;
-    } catch { /* next */ }
+    for (const c of candidates) {
+      i++;
+      try {
+        say(`Direct blocked — trying fallback route ${i}/${total}…`);
+        const text = await fetchText(wrap(c));
+        if (text && /#EXTM3U/i.test(text)) return text;
+      } catch { /* next route */ }
+    }
   }
-  if (/^http:\/\//i.test(url) && window.location.protocol === 'https:') {
-    throw new Error('That link is plain-http and every route to it failed. Ask your provider for an https playlist link, or an Xtream login on an https host.');
-  }
-  throw new Error('No route to that link worked (direct + 2 fallbacks failed). The host may be offline or blocking all web access.');
+  throw new Error('Every route failed (direct + fallbacks). The host may be offline, or all free fallback routes are busy — wait a minute and hit Reload. Prefer https links and Xtream logins.');
 }
 
-async function fetchPlaylistChannels(pl) {
-  const text = await loadM3UFromUrl(pl.url);
+async function fetchPlaylistChannels(pl, onStep) {
+  const text = await loadM3UFromUrl(pl.url, onStep);
   if (!/#EXTM3U/i.test(text)) {
     throw new Error('That address returned a web page, not a playlist. Paste the FULL M3U link from your provider — it usually ends with .m3u or contains "get.php?username=" — not just the homepage.');
   }
@@ -774,13 +789,14 @@ async function openPlaylist(id) {
   if (pl.channels) { renderIptvChannels(''); return; }
   $('iptv-playlist').innerHTML = '<div class="hint">Loading channels…</div>';
   $('iptv-empty').style.display = 'none';
+  const step = (m) => { $('iptv-playlist').innerHTML = `<div class="hint">${escapeHtml(m)}</div>`; };
   try {
-    pl.channels = await fetchPlaylistChannels(pl);
+    pl.channels = await fetchPlaylistChannels(pl, step);
     savePlaylists();
     renderSaved();
     renderIptvChannels('');
   } catch (e) {
-    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load “${escapeHtml(pl.name)}”.</strong> ${escapeHtml(e.message)}<br>Common cause: the host blocks cross-origin (CORS) requests. Xtream logins and https hosts usually work; plain-http hosts often don't from an https page.</div>`;
+    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load “${escapeHtml(pl.name)}”.</strong> ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -824,10 +840,11 @@ async function handleAddPlaylist() {
   const pl = { id: `pl-${Date.now()}`, name, url, channels: null };
   $('iptv-playlist').innerHTML = `<div class="hint">Loading “${escapeHtml(name)}”…</div>`;
   $('iptv-empty').style.display = 'none';
+  const step = (m) => { $('iptv-playlist').innerHTML = `<div class="hint">${escapeHtml(m)}</div>`; };
   try {
-    pl.channels = await fetchPlaylistChannels(pl);
+    pl.channels = await fetchPlaylistChannels(pl, step);
   } catch (e) {
-    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load playlist.</strong> ${escapeHtml(e.message)}<br>Common cause: the host blocks cross-origin (CORS) requests. Xtream logins and https hosts usually work; plain-http hosts often don't from an https page.</div>`;
+    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load playlist.</strong> ${escapeHtml(e.message)}</div>`;
     return;
   }
   iptvPlaylists.push(pl);
