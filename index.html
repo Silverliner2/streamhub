@@ -399,6 +399,12 @@
       <label for="set-twitch-token">Twitch OAuth token (optional)</label>
       <input type="text" id="set-twitch-token" placeholder="OAuth token (without 'oauth:' prefix)" autocomplete="off">
       <p style="margin-top:10px">Get these free at <b>dev.twitch.tv/console</b> → register an app (OAuth Redirect URL can be <b>http://localhost</b>) → Client ID from the console, token via implicit flow. Without them, StreamHub still plays any channel by name, plus a built-in featured list.</p>
+      <label for="set-canvas-mode">Force Canvas Mode (for Tesla driving)</label>
+      <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">
+        <input type="checkbox" id="set-canvas-mode" style="width:20px;height:20px">
+        <span>Enable canvas renderer (bypasses Tesla driving block)</span>
+      </label>
+      <p style="margin-top:6px;font-size:0.8rem;color:var(--text-muted)">Auto-detected: <span id="tesla-detect-result"></span></p>
       <div class="btn-row" style="margin-top:14px">
         <button class="btn btn-primary" id="settings-save">Save</button>
         <button class="btn btn-secondary" id="settings-close">Close</button>

@@ -29,9 +29,17 @@ function isTesla() {
   const platform = navigator.platform || '';
   // Tesla runs Chrome on Linux (QtWebEngine), often reports Linux x86_64
   // Check for Tesla-specific markers
-  return /tesla/i.test(ua) || 
-         (/Linux/.test(platform) && /Chrome/.test(ua) && navigator.maxTouchPoints > 1) ||
-         (platform === 'Linux x86_64' && /Chrome\/\d+/.test(ua) && screen.width >= 1920);
+  const isTeslaUA = /tesla/i.test(ua);
+  const isLinuxChromeTouch = /Linux/.test(platform) && /Chrome/.test(ua) && navigator.maxTouchPoints > 1;
+  const isLargeLinuxChrome = platform === 'Linux x86_64' && /Chrome\/\d+/.test(ua) && screen.width >= 1920;
+  const isQtWebEngine = /QtWebEngine/i.test(ua);
+  
+  // Also check for Tesla-specific screen dimensions (Model 3/Y: 1920x1080, Model S/X: 2200x1300)
+  const isTeslaScreen = (screen.width === 1920 && screen.height === 1080) || 
+                        (screen.width === 2200 && screen.height === 1300) ||
+                        (screen.width === 1920 && screen.height === 1200);
+  
+  return isTeslaUA || isLinuxChromeTouch || isLargeLinuxChrome || isQtWebEngine || isTeslaScreen;
 }
 
 /* Canvas-based HLS renderer (Teslurk bypass) */
@@ -39,7 +47,7 @@ class CanvasHlsPlayer {
   constructor(videoEl, canvasEl, options = {}) {
     this.video = videoEl;
     this.canvas = canvasEl;
-    this.ctx = canvasEl.getContext('2d', { willReadFrequently: false });
+    this.ctx = canvasEl.getContext('2d', { willReadFrequently: false, alpha: false });
     this.hls = null;
     this.options = options;
     this.playing = false;
@@ -48,36 +56,77 @@ class CanvasHlsPlayer {
     this.audioCtx = null;
     this.audioSource = null;
     this.mediaStream = null;
+    this.videoWidth = 0;
+    this.videoHeight = 0;
   }
 
   async loadSource(url) {
     // Use video element as hidden decoder, pump frames to canvas
+    // CRITICAL: muted=true allows decoding while driving on Tesla
     this.video.crossOrigin = 'anonymous';
     this.video.playsInline = true;
-    this.video.muted = false;
+    this.video.muted = true;  // Must be muted for Tesla to decode
     this.video.style.display = 'none';
+    this.video.style.position = 'absolute';
+    this.video.style.opacity = '0';
+    this.video.style.pointerEvents = 'none';
     this.canvas.style.display = 'block';
+    this.canvas.style.width = '100%';
+    this.canvas.style.height = '100%';
+    
+    // Ensure canvas is in the DOM and has size
+    this.resizeCanvas();
+    window.addEventListener('resize', this.resizeCanvas.bind(this));
     
     if (window.Hls && Hls.isSupported()) {
       this.hls = new Hls({
         enableWorker: true,
         lowLatencyMode: true,
         capLevelToPlayerSize: true,
-        // Canvas renderer specific options
         forceKeyFrameOnDisabled: true,
-        startLevel: -1
+        startLevel: -1,
+        // Allow background playback
+        backgroundLoader: true,
       });
       this.hls.loadSource(url);
       this.hls.attachMedia(this.video);
       
+      let resolved = false;
+      
+      const handleError = (_, data) => {
+        if (!data.fatal) return;
+        console.warn('HLS fatal error:', data.details, data.type);
+        
+        // Auto-retry on network/manifest errors (like Teslurk)
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR || 
+            data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          console.log('Attempting HLS recovery...');
+          this.hls.startLoad();
+          return;
+        }
+        
+        if (!resolved) {
+          resolved = true;
+          reject(new Error(data.details));
+        }
+      };
+      
+      this.hls.on(Hls.Events.ERROR, handleError);
+      
       return new Promise((resolve, reject) => {
         this.hls.once(Hls.Events.MANIFEST_PARSED, () => {
+          resolved = true;
           this.setupCanvasLoop();
+          // Unmute for audio after playback starts
+          this.video.muted = false;
           this.video.play().catch(() => {});
           resolve();
         });
         this.hls.once(Hls.Events.ERROR, (_, data) => {
-          if (data.fatal) reject(new Error(data.details));
+          if (data.fatal && !resolved) {
+            resolved = true;
+            reject(new Error(data.details));
+          }
         });
       });
     } else if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -87,25 +136,39 @@ class CanvasHlsPlayer {
         this.video.onerror = reject;
       });
       this.setupCanvasLoop();
+      this.video.muted = false;
       this.video.play().catch(() => {});
     } else {
       throw new Error('HLS not supported');
     }
   }
 
+  resizeCanvas() {
+    if (!this.canvas || !this.video) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+    this.canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+    this.ctx.scale(dpr, dpr);
+  }
+
   setupCanvasLoop() {
     const drawFrame = () => {
-      if (!this.playing || this.video.paused || this.video.ended) {
+      if (!this.playing) {
         this.frameId = requestAnimationFrame(drawFrame);
         return;
       }
       
       // Draw current video frame to canvas
-      if (this.video.readyState >= 2) {
-        const cw = this.canvas.width = this.video.videoWidth;
-        const ch = this.canvas.height = this.video.videoHeight;
-        if (cw && ch) {
-          this.ctx.drawImage(this.video, 0, 0, cw, ch);
+      // Check HAVE_CURRENT_DATA (readyState >= 2) for frame availability
+      if (this.video.readyState >= 2 && !this.video.paused && !this.video.ended) {
+        const vw = this.video.videoWidth;
+        const vh = this.video.videoHeight;
+        if (vw && vh) {
+          this.videoWidth = vw;
+          this.videoHeight = vh;
+          // Draw to canvas (CSS size handled by style, we draw at video resolution)
+          this.ctx.drawImage(this.video, 0, 0, vw, vh);
         }
       }
       this.frameId = requestAnimationFrame(drawFrame);
@@ -115,14 +178,21 @@ class CanvasHlsPlayer {
     this.frameId = requestAnimationFrame(drawFrame);
     
     // Setup audio via Web Audio API (works while driving)
-    try {
-      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      this.mediaStream = this.video.captureStream();
-      this.audioSource = this.audioCtx.createMediaStreamSource(this.mediaStream);
-      this.audioSource.connect(this.audioCtx.destination);
-    } catch (e) {
-      console.warn('Web Audio setup failed:', e);
-    }
+    // Delay slightly to ensure video is playing
+    setTimeout(() => {
+      try {
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // Resume audio context if suspended (required by autoplay policy)
+        if (this.audioCtx.state === 'suspended') {
+          this.audioCtx.resume();
+        }
+        this.mediaStream = this.video.captureStream();
+        this.audioSource = this.audioCtx.createMediaStreamSource(this.mediaStream);
+        this.audioSource.connect(this.audioCtx.destination);
+      } catch (e) {
+        console.warn('Web Audio setup failed:', e);
+      }
+    }, 100);
   }
 
   play() {
@@ -136,15 +206,29 @@ class CanvasHlsPlayer {
   }
 
   setVolume(vol) {
+    if (this.audioSource && this.audioCtx) {
+      // Use gain node for volume control
+      if (!this.gainNode) {
+        this.gainNode = this.audioCtx.createGain();
+        this.audioSource.disconnect();
+        this.audioSource.connect(this.gainNode);
+        this.gainNode.connect(this.audioCtx.destination);
+      }
+      this.gainNode.gain.value = vol;
+    }
     this.video.volume = vol;
   }
 
   setMuted(muted) {
     this.video.muted = muted;
+    if (this.gainNode) {
+      this.gainNode.gain.value = muted ? 0 : (this.video.volume || 1);
+    }
   }
 
   destroy() {
     this.playing = false;
+    window.removeEventListener('resize', this.resizeCanvas.bind(this));
     if (this.frameId) cancelAnimationFrame(this.frameId);
     if (this.hls) {
       try { this.hls.destroy(); } catch {}
@@ -153,6 +237,10 @@ class CanvasHlsPlayer {
     if (this.audioSource) {
       try { this.audioSource.disconnect(); } catch {}
       this.audioSource = null;
+    }
+    if (this.gainNode) {
+      try { this.gainNode.disconnect(); } catch {}
+      this.gainNode = null;
     }
     if (this.audioCtx) {
       try { this.audioCtx.close(); } catch {}
@@ -196,7 +284,26 @@ const playerWrapper = $('player-wrapper');
 const playerChat = $('player-chat');
 const playerTitle = $('player-title');
 const sourceSelect = $('source-select');
-const USE_CANVAS = isTesla();
+function useCanvas() {
+  return isTesla() || store.get('sh.canvas.force', false);
+}
+
+function updateTeslaDetectDisplay() {
+  const el = $('tesla-detect-result');
+  if (!el) return;
+  const detected = isTesla();
+  const forced = store.get('sh.canvas.force', false);
+  if (forced) {
+    el.textContent = 'FORCED ON (manual override)';
+    el.style.color = 'var(--accent)';
+  } else if (detected) {
+    el.textContent = 'Tesla detected ✓';
+    el.style.color = 'var(--accent)';
+  } else {
+    el.textContent = 'Not detected (desktop/mobile)';
+    el.style.color = 'var(--text-muted)';
+  }
+}
 
 function destroyHls() { 
   if (hls) { try { hls.destroy(); } catch {} hls = null; } 
@@ -229,6 +336,32 @@ $('fullscreen-btn').addEventListener('click', () => {
     (playerContainer.requestFullscreen || playerWrapper.requestFullscreen || (() => Promise.reject())).call(playerContainer).catch(() => {});
   } else document.exitFullscreen().catch(() => {});
 });
+
+// Handle fullscreen change to resize canvas
+document.addEventListener('fullscreenchange', () => {
+  if (canvasPlayer && document.fullscreenElement === playerContainer) {
+    // Force canvas resize on next frame
+    requestAnimationFrame(() => canvasPlayer.resizeCanvas());
+  }
+});
+
+// Handle visibility change (Tesla switches apps while driving)
+document.addEventListener('visibilitychange', () => {
+  if (canvasPlayer) {
+    if (document.hidden) {
+      canvasPlayer.pause();
+    } else if (playerContainer.classList.contains('active')) {
+      canvasPlayer.play();
+    }
+  }
+});
+
+// Ensure canvas player works when page is restored from bfcache
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted && canvasPlayer && playerContainer.classList.contains('active')) {
+    canvasPlayer.play();
+  }
+});
 $('theater-btn').addEventListener('click', () => {
   const h = document.querySelector('.player-header');
   const f = document.querySelector('.player-footer');
@@ -252,12 +385,12 @@ $('popout-btn').addEventListener('click', () => {
 async function playHlsDirect(url) {
   destroyHls();
   
-  if (USE_CANVAS) {
+  if (useCanvas()) {
     // Canvas renderer for Tesla (bypasses driving block)
     playerWrapper.innerHTML = `
-      <video id="sh-video" playsinline muted style="display:none"></video>
-      <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block"></canvas>
-      <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10">
+      <video id="sh-video" playsinline muted style="display:none;position:absolute;opacity:0;pointer-events:none"></video>
+      <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block;touch-action:none"></canvas>
+      <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10;pointer-events:none">
         <div style="width:40px;height:40px;border:3px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px"></div>
         <div>Loading stream (canvas mode)...</div>
       </div>
@@ -266,6 +399,18 @@ async function playHlsDirect(url) {
     
     const video = $('sh-video');
     const canvas = $('sh-canvas');
+    
+    // Ensure canvas has proper dimensions before creating player
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    
+    // Set explicit video dimensions for captureStream
+    video.width = 1920;
+    video.height = 1080;
+    
+    // Force a layout pass
+    await new Promise(r => requestAnimationFrame(r));
+    
     canvasPlayer = new CanvasHlsPlayer(video, canvas);
     
     try {
@@ -490,7 +635,7 @@ function openTwitchPlayer(channel, title) {
   currentStream = { type: 'twitch', channel };
   openPlayer(title || channel);
   
-  if (USE_CANVAS) {
+  if (useCanvas()) {
     // Canvas HLS player for Tesla (bypasses driving block)
     sourceSelect.innerHTML = '<option value="hls">Twitch HLS (Canvas - works while driving)</option>';
     loadTwitchHls(channel);
@@ -508,9 +653,9 @@ function openTwitchPlayer(channel, title) {
 
 async function loadTwitchHls(channel) {
   playerWrapper.innerHTML = `
-    <video id="sh-video" playsinline muted style="display:none"></video>
-    <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block"></canvas>
-    <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10">
+    <video id="sh-video" playsinline muted style="display:none;position:absolute;opacity:0;pointer-events:none"></video>
+    <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block;touch-action:none"></canvas>
+    <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10;pointer-events:none">
       <div style="width:40px;height:40px;border:3px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px"></div>
       <div>Loading Twitch HLS...</div>
     </div>
@@ -519,6 +664,18 @@ async function loadTwitchHls(channel) {
   
   const video = $('sh-video');
   const canvas = $('sh-canvas');
+  
+  // Ensure canvas has proper dimensions before creating player
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  
+  // Set explicit video dimensions for captureStream
+  video.width = 1920;
+  video.height = 1080;
+  
+  // Force a layout pass
+  await new Promise(r => requestAnimationFrame(r));
+  
   canvasPlayer = new CanvasHlsPlayer(video, canvas);
   
   try {
@@ -1209,6 +1366,8 @@ if (openPlaylistId && currentPlaylist()) {
 $('settings-btn').addEventListener('click', () => {
   $('set-twitch-id').value = store.get('sh.twitch.id', '');
   $('set-twitch-token').value = store.get('sh.twitch.token', '');
+  $('set-canvas-mode').checked = store.get('sh.canvas.force', false);
+  updateTeslaDetectDisplay();
   $('settings-modal').classList.add('open');
 });
 $('settings-close').addEventListener('click', () => $('settings-modal').classList.remove('open'));
@@ -1218,6 +1377,7 @@ $('settings-modal').addEventListener('click', (e) => {
 $('settings-save').addEventListener('click', () => {
   store.set('sh.twitch.id', $('set-twitch-id').value.trim());
   store.set('sh.twitch.token', $('set-twitch-token').value.trim());
+  store.set('sh.canvas.force', $('set-canvas-mode').checked);
   $('settings-modal').classList.remove('open');
   loadTwitchDirectory();
 });
