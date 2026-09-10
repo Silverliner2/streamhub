@@ -1,0 +1,27 @@
+{
+  "name": "StreamHub",
+  "short_name": "StreamHub",
+  "description": "Watch Twitch, YouTube, and IPTV on Tesla Browser",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["entertainment", "video"],
+  "screenshots": []
+}

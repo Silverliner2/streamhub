@@ -1,0 +1,664 @@
+/* ============================================================
+ * StreamHub — Tesla-optimized Twitch / YouTube / IPTV viewer
+ * Static-only (GitHub Pages friendly). No backend, no secrets.
+ *
+ * The "Teslurk bypass" explained:
+ * twitch.tv itself is a heavy SPA that struggles in the Tesla
+ * browser (QtWebEngine/Chromium). Teslurk sidesteps it by embedding
+ * ONLY the stream player + chat via Twitch's official embed iframes
+ * (player.twitch.tv / twitch.tv/embed/.../chat) with ?parent=<host>.
+ * StreamHub does exactly the same for Twitch, and applies the same
+ * idea to YouTube (youtube-nocookie embed, no surrounding SPA) and
+ * to IPTV (direct HLS via hls.js, no native-app DRM/WebRTC needs).
+ * ============================================================ */
+'use strict';
+
+/* ---------- tiny helpers ---------- */
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+/* Twitch embed requires every ancestor host in `parent`. Include the
+ * current host plus common GitHub Pages / local hosts so the same
+ * deployment works everywhere (Tesla browser included). */
+function twitchParents() {
+  const hosts = new Set([window.location.hostname || 'localhost', 'localhost', '127.0.0.1']);
+  return [...hosts].filter(Boolean).map((h) => `parent=${encodeURIComponent(h)}`).join('&');
+}
+
+/* ---------- tabs ---------- */
+const tabs = document.querySelectorAll('.tab');
+const sections = document.querySelectorAll('.section');
+tabs.forEach((tab) => {
+  tab.addEventListener('click', () => {
+    tabs.forEach((t) => t.classList.remove('active'));
+    sections.forEach((s) => s.classList.remove('active'));
+    tab.classList.add('active');
+    $(tab.dataset.tab).classList.add('active');
+  });
+});
+
+/* ---------- player shell ---------- */
+let hls = null;
+let currentStream = null; // { type:'twitch'|'youtube'|'iptv', ... }
+const playerContainer = $('player-container');
+const playerWrapper = $('player-wrapper');
+const playerChat = $('player-chat');
+const playerTitle = $('player-title');
+const sourceSelect = $('source-select');
+
+function destroyHls() { if (hls) { try { hls.destroy(); } catch {} hls = null; } }
+
+function openPlayer(title) {
+  playerTitle.textContent = title || 'StreamHub Player';
+  playerChat.classList.remove('open');
+  playerChat.innerHTML = '';
+  $('chat-btn').style.display = 'none';
+  document.querySelector('.player-footer').style.display = 'flex';
+  document.querySelector('.player-header').style.display = 'flex';
+  playerContainer.classList.add('active');
+}
+function closePlayer() {
+  playerContainer.classList.remove('active');
+  destroyHls();
+  playerWrapper.innerHTML = '';
+  playerChat.innerHTML = '';
+  playerChat.classList.remove('open');
+  currentStream = null;
+}
+$('close-player').addEventListener('click', closePlayer);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && playerContainer.classList.contains('active')) closePlayer();
+});
+$('fullscreen-btn').addEventListener('click', () => {
+  if (!document.fullscreenElement) {
+    (playerContainer.requestFullscreen || playerWrapper.requestFullscreen || (() => Promise.reject())).call(playerContainer).catch(() => {});
+  } else document.exitFullscreen().catch(() => {});
+});
+$('theater-btn').addEventListener('click', () => {
+  const h = document.querySelector('.player-header');
+  const f = document.querySelector('.player-footer');
+  const hidden = h.style.display === 'none';
+  h.style.display = hidden ? 'flex' : 'none';
+  f.style.display = hidden ? 'flex' : 'none';
+});
+$('chat-btn').addEventListener('click', () => playerChat.classList.toggle('open'));
+$('popout-btn').addEventListener('click', () => {
+  if (!currentStream) return;
+  const w = 1280, hgt = 720;
+  const left = Math.max(0, (screen.width - w) / 2), top = Math.max(0, (screen.height - hgt) / 2);
+  const pop = window.open('', 'StreamHubPopout', `width=${w},height=${hgt},left=${left},top=${top}`);
+  if (!pop) return;
+  pop.document.write(`<!DOCTYPE html><html><head><title>${escapeHtml(playerTitle.textContent)} — StreamHub</title><style>html,body{margin:0;height:100%;background:#000;overflow:hidden}iframe,video{width:100%;height:100%;border:0}</style></head><body>${playerWrapper.innerHTML}</body></html>`);
+  pop.document.close();
+});
+
+/* Direct-HLS playback (IPTV). Same reason it works in the Tesla
+ * browser: plain https progressive/HLS segments, no DRM, no WebRTC. */
+function playHlsDirect(url) {
+  destroyHls();
+  playerWrapper.innerHTML = '<video id="sh-video" controls playsinline autoplay style="background:#000"></video>';
+  const video = $('sh-video');
+  video.muted = false;
+  if (/\.mp4($|\?)/i.test(url) || /\.mov($|\?)/i.test(url)) {
+    video.src = url;
+    video.play().catch(() => {});
+    return;
+  }
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ enableWorker: true, lowLatencyMode: true, capLevelToPlayerSize: true });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (!data || !data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        playerWrapper.innerHTML = `<div style="display:flex;height:100%;align-items:center;justify-content:center;text-align:center;padding:24px;color:#8b98ad">Stream blocked by CORS or offline.<br>Tip: many IPTV hosts need a proxy or an Xtream login.</div>`;
+      }
+      destroyHls();
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = url;
+    video.addEventListener('loadedmetadata', () => video.play().catch(() => {}));
+  } else {
+    playerWrapper.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8b98ad">HLS not supported in this browser.</div>';
+  }
+}
+
+/* ============================================================
+ * TWITCH — official embed (the Teslurk bypass)
+ * ============================================================ */
+const TWITCH_FEATURED = ['shroud', 'ninja', 'xqc', 'pokimane', 'summit1g', 'tarik', 'shylily', 'ludwig', 'asmongold', 'ESL_CSGO', 'riotgames', 'hasanabi'];
+const TWITCH_API = 'https://api.twitch.tv/helix';
+
+function twitchEmbedUrl(channel) {
+  return `https://player.twitch.tv/?channel=${encodeURIComponent(channel)}&${twitchParents()}&autoplay=true&muted=false`;
+}
+function twitchChatUrl(channel) {
+  return `https://www.twitch.tv/embed/${encodeURIComponent(channel)}/chat?${twitchParents()}&darkpopout`;
+}
+function twitchThumb(userLogin) {
+  return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${encodeURIComponent(userLogin.toLowerCase())}-320x180.jpg`;
+}
+
+function openTwitchPlayer(channel, title) {
+  channel = String(channel || '').replace(/^@/, '').trim();
+  if (!channel) return;
+  currentStream = { type: 'twitch', channel };
+  openPlayer(title || channel);
+  sourceSelect.innerHTML = '<option value="embed">Twitch player (Tesla-safe)</option>';
+  playerWrapper.innerHTML = `<iframe src="${twitchEmbedUrl(channel)}" allowfullscreen allow="autoplay; fullscreen" scrolling="no" title="${escapeHtml(channel)}"></iframe>`;
+  playerChat.innerHTML = `<iframe src="${twitchChatUrl(channel)}" title="chat"></iframe>`;
+  $('chat-btn').style.display = '';
+  $('chat-btn').onclick = () => playerChat.classList.toggle('open');
+  // Tesla = usually parked viewing; open chat only on wide screens by default
+  if (window.innerWidth > 900) playerChat.classList.add('open');
+}
+sourceSelect.addEventListener('change', () => {
+  if (!currentStream) return;
+  if (currentStream.type === 'twitch') openTwitchPlayer(currentStream.channel);
+  else if (currentStream.type === 'youtube') openYouTubePlayer(currentStream.videoId, currentStream.title, sourceSelect.value);
+  else if (currentStream.type === 'iptv') playHlsDirect(currentStream.url);
+});
+
+function renderTwitchList(items) {
+  const grid = $('twitch-grid');
+  const empty = $('twitch-empty');
+  if (!items.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  grid.innerHTML = items.map((c) => `
+    <div class="card" tabindex="0" data-login="${escapeHtml(c.login)}" data-name="${escapeHtml(c.name)}">
+      <div class="card-thumb">
+        <img loading="lazy" src="${escapeHtml(c.thumb)}" alt="${escapeHtml(c.name)}" onerror="this.style.display='none'">
+        ${c.live ? '<span class="live-badge">Live</span>' : ''}
+      </div>
+      <div class="card-info">
+        <div class="card-title">${escapeHtml(c.name)}</div>
+        <div class="card-meta">${escapeHtml(c.meta || 'Tap to watch')}</div>
+      </div>
+    </div>`).join('');
+  grid.querySelectorAll('.card').forEach((card) => {
+    const go = () => openTwitchPlayer(card.dataset.login, card.dataset.name);
+    card.addEventListener('click', go);
+    card.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+}
+
+/* Live directory via Helix — only when the user adds their own free
+ * Client-ID + token in Settings (Twitch requires auth; there is no
+ * legal no-key directory API, which is why Teslurk uses a backend). */
+async function tryTwitchHelix(path) {
+  const id = store.get('sh.twitch.id', '');
+  const token = store.get('sh.twitch.token', '');
+  if (!id || !token) return null;
+  const r = await fetch(`${TWITCH_API}${path}`, {
+    headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+  });
+  if (!r.ok) throw new Error(`Twitch API ${r.status}`);
+  return r.json();
+}
+
+async function loadTwitchDirectory() {
+  const hint = $('twitch-browse-hint');
+  try {
+    const [streams, games] = await Promise.all([
+      tryTwitchHelix('/streams?first=20'),
+      tryTwitchHelix('/games/top?first=8'),
+    ]);
+    if (streams && streams.data) {
+      hint.style.display = 'none';
+      renderTwitchList(streams.data.map((s) => ({
+        login: s.user_login, name: s.user_name, live: true,
+        thumb: (s.thumbnail_url || '').replace('{width}', '320').replace('{height}', '180'),
+        meta: `${s.game_name || ''} • ${Number(s.viewer_count || 0).toLocaleString()} viewers`,
+      })));
+      if (games && games.data) {
+        $('twitch-chips').innerHTML = games.data.map((g) => `<button class="chip" data-game="${escapeHtml(g.name)}">${escapeHtml(g.name)}</button>`).join('');
+        $('twitch-chips').querySelectorAll('.chip').forEach((ch) => ch.addEventListener('click', () => {
+          $('twitch-search').value = '';
+          searchTwitchGame(ch.dataset.game);
+        }));
+      }
+      return;
+    }
+  } catch { /* fall through to featured */ }
+  hint.style.display = 'block';
+  hint.innerHTML = '<strong>Featured channels</strong> (no login needed — tap any card). For a live directory + search, add a free Twitch Client-ID + token in ⚙ Settings.';
+  $('twitch-chips').innerHTML = '';
+  renderTwitchList(TWITCH_FEATURED.map((login) => ({
+    login, name: login, live: false, thumb: twitchThumb(login), meta: 'Tap to watch',
+  })));
+}
+
+async function searchTwitchGame(gameName) {
+  try {
+    const id = store.get('sh.twitch.id', ''), token = store.get('sh.twitch.token', '');
+    let g = await (await fetch(`${TWITCH_API}/games?name=${encodeURIComponent(gameName)}`, {
+      headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+    })).json();
+    const gid = g.data && g.data[0] && g.data[0].id;
+    if (!gid) return;
+    const s = await (await fetch(`${TWITCH_API}/streams?game_id=${gid}&first=20`, {
+      headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+    })).json();
+    renderTwitchList((s.data || []).map((x) => ({
+      login: x.user_login, name: x.user_name, live: true,
+      thumb: (x.thumbnail_url || '').replace('{width}', '320').replace('{height}', '180'),
+      meta: `${Number(x.viewer_count || 0).toLocaleString()} viewers`,
+    })));
+  } catch { /* ignore */ }
+}
+
+async function handleTwitchSearch() {
+  const q = $('twitch-search').value.trim().replace(/^@/, '');
+  if (!q) return loadTwitchDirectory();
+  // If it looks like a channel name, just play it (works with zero API).
+  if (/^[A-Za-z0-9_]{2,25}$/.test(q)) {
+    const id = store.get('sh.twitch.id', ''), token = store.get('sh.twitch.token', '');
+    if (id && token) {
+      try {
+        const r = await (await fetch(`${TWITCH_API}/search/channels?query=${encodeURIComponent(q)}&first=10`, {
+          headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+        })).json();
+        if (r.data && r.data.length) {
+          renderTwitchList(r.data.map((c) => ({
+            login: c.broadcaster_login, name: c.display_name,
+            live: c.is_live, thumb: c.thumbnail_url || twitchThumb(c.broadcaster_login),
+            meta: c.is_live ? `${c.game_name || ''} • live` : 'Offline — tap to open channel',
+          })));
+          return;
+        }
+      } catch { /* fall through */ }
+    }
+    openTwitchPlayer(q, q);
+  }
+}
+$('twitch-go').addEventListener('click', handleTwitchSearch);
+$('twitch-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleTwitchSearch(); });
+
+/* ============================================================
+ * YOUTUBE — privacy embed (same bypass idea as Twitch)
+ * Search via Piped API instances (no key needed); playback is
+ * always the official youtube-nocookie embed, which the Tesla
+ * browser handles (it's the same player as the Theater app).
+ * ============================================================ */
+const PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.reallyaweso.me',
+  'https://api.piped.private.coffee',
+];
+const YT_SHORTS = [
+  { id: 'aqz-KE-bpKQ', title: 'Big Buck Bunny (4K)', author: 'Blender Foundation' },
+  { id: 'eRsGyueVLvQ', title: 'Sintel (4K)', author: 'Blender Foundation' },
+  { id: 'jNQXAC9IVRw', title: 'Me at the zoo — first YouTube video', author: 'jawed' },
+];
+
+function extractYouTubeId(input) {
+  const s = String(input || '').trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  const m = s.match(/(?:youtube\.com\/(?:watch\?[^#]*v=|shorts\/|live\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+function openYouTubePlayer(videoId, title, source) {
+  videoId = String(videoId || '').trim();
+  if (!videoId) return;
+  currentStream = { type: 'youtube', videoId, title: title || videoId };
+  openPlayer(title || 'YouTube');
+  sourceSelect.innerHTML = `
+    <option value="nocookie">YouTube embed (Tesla-safe)</option>
+    <option value="invidious">Invidious mirror</option>`;
+  if (source) sourceSelect.value = source;
+  const src = (sourceSelect.value === 'invidious')
+    ? `https://yewtu.be/embed/${encodeURIComponent(videoId)}?autoplay=1&local=true`
+    : `https://www.youtube-nocookie.com/embed/${encodeURIComponent(videoId)}?autoplay=1&controls=1&rel=0&playsinline=1`;
+  playerWrapper.innerHTML = `<iframe src="${src}" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen title="YouTube player"></iframe>`;
+}
+
+function renderYouTubeList(videos) {
+  const grid = $('youtube-grid');
+  const empty = $('youtube-empty');
+  if (!videos.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  grid.innerHTML = videos.map((v) => `
+    <div class="card" tabindex="0" data-id="${escapeHtml(v.id)}" data-title="${escapeHtml(v.title)}">
+      <div class="card-thumb">
+        <img loading="lazy" src="https://i.ytimg.com/vi/${escapeHtml(v.id)}/hqdefault.jpg" alt="" onerror="this.style.display='none'">
+      </div>
+      <div class="card-info">
+        <div class="card-title">${escapeHtml(v.title)}</div>
+        <div class="card-meta">${escapeHtml(v.author || 'YouTube')}</div>
+      </div>
+    </div>`).join('');
+  grid.querySelectorAll('.card').forEach((card) => {
+    const go = () => openYouTubePlayer(card.dataset.id, card.dataset.title);
+    card.addEventListener('click', go);
+    card.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+}
+
+async function pipedSearch(query) {
+  let lastErr = null;
+  for (const base of PIPED_INSTANCES) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 9000);
+      const r = await fetch(`${base}/search?q=${encodeURIComponent(query)}&filter=videos`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) continue;
+      const j = await r.json();
+      const items = (j.items || j).filter((x) => x && (x.url || '').includes('/watch?v='));
+      if (items.length) {
+        return items.slice(0, 20).map((x) => ({
+          id: String(x.url.split('v=')[1] || '').split('&')[0],
+          title: x.title || 'Untitled',
+          author: x.uploaderName || '',
+        })).filter((x) => x.id);
+      }
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('search failed');
+}
+
+async function handleYouTubeGo() {
+  const q = $('youtube-search').value.trim();
+  if (!q) { renderYouTubeList(YT_SHORTS); return; }
+  const id = extractYouTubeId(q);
+  if (id) return openYouTubePlayer(id, 'YouTube video');
+  $('youtube-empty').style.display = 'none';
+  $('youtube-grid').innerHTML = '<div class="hint">Searching…</div>';
+  try {
+    renderYouTubeList(await pipedSearch(q));
+  } catch {
+    $('youtube-grid').innerHTML = '';
+    $('youtube-empty').style.display = 'block';
+  }
+}
+$('youtube-go').addEventListener('click', handleYouTubeGo);
+$('youtube-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleYouTubeGo(); });
+$('youtube-chips').innerHTML = '';
+renderYouTubeList(YT_SHORTS);
+
+/* ============================================================
+ * IPTV — M3U / Xtream, direct HLS via hls.js
+ * ============================================================ */
+const SAMPLE_M3U = `#EXTM3U
+#EXTINF:-1 tvg-logo="" group-title="Demo",Red Bull TV
+https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master_1660.m3u8
+#EXTINF:-1 group-title="Demo",NASA TV (public)
+https://ntv1.akamaized.net/hls/live/2014075/NASA-NTV1-HLS/master.m3u8
+#EXTINF:-1 group-title="Demo",Al Jazeera English
+https://live-hls-web-aje.getaj.net/AJE/index.m3u8`;
+
+/* StrymTV-style: many named playlists, each a tap-able tile.
+ * Tapping a playlist tile shows its channels as logo tiles;
+ * tapping a channel opens a sheet — hit Play. */
+let iptvPlaylists = store.get('sh.iptv.playlists', []);
+let openPlaylistId = store.get('sh.iptv.open', null);
+let pendingChannel = null;
+
+function savePlaylists() {
+  // persist playlist defs + cached channels (capped so localStorage stays small)
+  store.set('sh.iptv.playlists', iptvPlaylists.map((p) => ({
+    ...p, channels: (p.channels || []).slice(0, 1500),
+  })));
+  store.set('sh.iptv.open', openPlaylistId);
+}
+
+function guessName(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '').split('.')[0];
+    return host ? host.toUpperCase().slice(0, 18) : 'Playlist';
+  } catch { return 'Playlist'; }
+}
+
+function renderSaved() {
+  const grid = $('iptv-saved');
+  const empty = $('iptv-saved-empty');
+  if (!iptvPlaylists.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  grid.innerHTML = iptvPlaylists.map((p) => `
+    <div class="plist-card ${p.id === openPlaylistId ? 'open' : ''}" tabindex="0" data-id="${p.id}">
+      <div class="plist-name">${escapeHtml(p.name)}</div>
+      <div class="plist-count">${p.channels ? `${p.channels.length} channels` : 'Tap to load'}</div>
+      <div class="plist-actions">
+        <button class="mini-btn" data-act="refresh" title="Re-fetch">↻ Reload</button>
+        <button class="mini-btn danger" data-act="delete" title="Remove">✕ Remove</button>
+      </div>
+    </div>`).join('');
+  grid.querySelectorAll('.plist-card').forEach((card) => {
+    const id = card.dataset.id;
+    const open = () => openPlaylist(id);
+    card.addEventListener('click', (e) => {
+      const act = e.target.dataset && e.target.dataset.act;
+      if (act === 'delete') { e.stopPropagation(); deletePlaylist(id); return; }
+      if (act === 'refresh') { e.stopPropagation(); refreshPlaylist(id); return; }
+      open();
+    });
+    card.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+  });
+}
+
+function currentPlaylist() {
+  return iptvPlaylists.find((p) => p.id === openPlaylistId) || null;
+}
+
+async function fetchPlaylistChannels(pl) {
+  const text = await loadM3UFromUrl(pl.url);
+  const chans = parseM3U(text);
+  if (!chans.length) throw new Error('No channels found in that playlist.');
+  return chans;
+}
+
+async function openPlaylist(id) {
+  const pl = iptvPlaylists.find((p) => p.id === id);
+  if (!pl) return;
+  openPlaylistId = id;
+  renderSaved();
+  const title = $('iptv-channels-title');
+  title.style.display = 'block';
+  title.innerHTML = `Channels — <em>${escapeHtml(pl.name)}</em>`;
+  $('iptv-filter-row').style.display = 'flex';
+  if (pl.channels) { renderIptvChannels(''); return; }
+  $('iptv-playlist').innerHTML = '<div class="hint">Loading channels…</div>';
+  $('iptv-empty').style.display = 'none';
+  try {
+    pl.channels = await fetchPlaylistChannels(pl);
+    savePlaylists();
+    renderSaved();
+    renderIptvChannels('');
+  } catch (e) {
+    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load “${escapeHtml(pl.name)}”.</strong> ${escapeHtml(e.message)}<br>Common cause: the host blocks cross-origin (CORS) requests. Xtream logins and https hosts usually work; plain-http hosts often don't from an https page.</div>`;
+  }
+}
+
+async function refreshPlaylist(id) {
+  const pl = iptvPlaylists.find((p) => p.id === id);
+  if (!pl) return;
+  try {
+    pl.channels = await fetchPlaylistChannels(pl);
+    savePlaylists();
+    renderSaved();
+    if (id === openPlaylistId) renderIptvChannels($('iptv-filter').value);
+  } catch (e) {
+    alert(`Reload failed: ${e.message}`);
+  }
+}
+
+function deletePlaylist(id) {
+  iptvPlaylists = iptvPlaylists.filter((p) => p.id !== id);
+  if (openPlaylistId === id) {
+    openPlaylistId = null;
+    $('iptv-playlist').innerHTML = '';
+    $('iptv-channels-title').style.display = 'none';
+    $('iptv-filter-row').style.display = 'none';
+    $('iptv-empty').style.display = 'none';
+  }
+  savePlaylists();
+  renderSaved();
+}
+
+async function handleAddPlaylist() {
+  let url = $('iptv-url').value.trim();
+  const user = $('xtream-user').value.trim();
+  const pass = $('xtream-pass').value.trim();
+  let name = $('iptv-name').value.trim();
+  if (!url) { alert('Paste an .m3u/.m3u8 link (or Xtream host) first.'); return; }
+  // bare "host:port" + Xtream creds → build playlist URL automatically
+  if (user && pass && !/\.m3u8?($|\?)/i.test(url)) {
+    url = `${url.replace(/\/$/, '')}/get.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&type=m3u_plus&output=mpegts`;
+  }
+  if (!name) name = guessName($('iptv-url').value.trim());
+  const pl = { id: `pl-${Date.now()}`, name, url, channels: null };
+  $('iptv-playlist').innerHTML = `<div class="hint">Loading “${escapeHtml(name)}”…</div>`;
+  $('iptv-empty').style.display = 'none';
+  try {
+    pl.channels = await fetchPlaylistChannels(pl);
+  } catch (e) {
+    $('iptv-playlist').innerHTML = `<div class="hint"><strong>Could not load playlist.</strong> ${escapeHtml(e.message)}<br>Common cause: the host blocks cross-origin (CORS) requests. Xtream logins and https hosts usually work; plain-http hosts often don't from an https page.</div>`;
+    return;
+  }
+  iptvPlaylists.push(pl);
+  $('iptv-name').value = '';
+  $('iptv-url').value = '';
+  $('iptv-filter').value = '';
+  savePlaylists();
+  openPlaylist(pl.id);
+}
+
+function tileLogo(c) {
+  const letter = escapeHtml((c.name || '?').trim().charAt(0).toUpperCase());
+  if (c.logo) return `<span class="fallback">${letter}</span><img loading="lazy" src="${escapeHtml(c.logo)}" alt="" onerror="this.remove()">`;
+  return `<span class="fallback">${letter}</span>`;
+}
+
+function renderIptvChannels(filter) {
+  const pl = currentPlaylist();
+  const box = $('iptv-playlist');
+  const empty = $('iptv-empty');
+  if (!pl || !pl.channels) { box.innerHTML = ''; return; }
+  const q = String(filter || '').toLowerCase();
+  const list = pl.channels.filter((c) =>
+    !q || c.name.toLowerCase().includes(q) || (c.group || '').toLowerCase().includes(q));
+  if (!list.length) {
+    box.innerHTML = '';
+    empty.style.display = 'block';
+    empty.innerHTML = `<p>${q ? 'No channels match that filter.' : 'No channels in this playlist.'}</p>`;
+    return;
+  }
+  empty.style.display = 'none';
+  box.innerHTML = list.slice(0, 500).map((c, i) => `
+    <div class="tile" tabindex="0" data-idx="${i}">
+      <div class="tile-logo">${tileLogo(c)}</div>
+      <div class="tile-name">${escapeHtml(c.name)}</div>
+      ${c.group ? `<div class="tile-group">${escapeHtml(c.group)}</div>` : ''}
+    </div>`).join('');
+  // keep a reference to the filtered list for tap → sheet
+  box.querySelectorAll('.tile').forEach((el) => {
+    const c = list[Number(el.dataset.idx)];
+    const go = () => openChannelSheet(c);
+    el.addEventListener('click', go);
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+}
+
+/* Tap a channel → sheet with big Play button */
+function openChannelSheet(c) {
+  pendingChannel = c;
+  $('ch-name').textContent = c.name;
+  $('ch-group').textContent = c.group || '';
+  $('ch-logo-wrap').innerHTML = c.logo
+    ? `<img src="${escapeHtml(c.logo)}" alt="" onerror="this.style.display='none'">` : '';
+  $('channel-modal').classList.add('open');
+}
+function playPendingChannel() {
+  if (!pendingChannel) return;
+  const c = pendingChannel;
+  $('channel-modal').classList.remove('open');
+  currentStream = { type: 'iptv', url: c.url };
+  openPlayer(c.name);
+  sourceSelect.innerHTML = '<option value="hls">Direct HLS (Tesla-safe)</option>';
+  playHlsDirect(c.url);
+}
+$('ch-play').addEventListener('click', playPendingChannel);
+$('ch-close').addEventListener('click', () => $('channel-modal').classList.remove('open'));
+$('channel-modal').addEventListener('click', (e) => {
+  if (e.target === $('channel-modal')) $('channel-modal').classList.remove('open');
+});
+
+function parseM3U(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const out = [];
+  let meta = null;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF')) {
+      const comma = line.lastIndexOf(',');
+      const attrs = line.slice(8, comma > 8 ? comma : undefined);
+      meta = {
+        name: comma > 8 ? line.slice(comma + 1).trim() : 'Untitled',
+        group: (/group-title="([^"]*)"/.exec(attrs) || [])[1] || '',
+        logo: (/tvg-logo="([^"]*)"/.exec(attrs) || [])[1] || '',
+      };
+    } else if (!line.startsWith('#')) {
+      if (meta && /^https?:\/\//i.test(line)) out.push({ ...meta, url: line });
+      meta = null;
+    }
+  }
+  return out;
+}
+
+async function loadM3UFromUrl(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
+
+$('iptv-add').addEventListener('click', handleAddPlaylist);
+$('iptv-xtream').addEventListener('click', () => {
+  const row = $('xtream-row');
+  row.style.display = row.style.display === 'none' ? 'flex' : 'none';
+});
+$('iptv-sample').addEventListener('click', () => {
+  const pl = { id: `pl-${Date.now()}`, name: 'Sample', url: 'built-in', channels: parseM3U(SAMPLE_M3U) };
+  iptvPlaylists.push(pl);
+  savePlaylists();
+  openPlaylist(pl.id);
+});
+$('iptv-filter').addEventListener('input', debounce(() => renderIptvChannels($('iptv-filter').value), 200));
+
+/* restore saved playlists; reopen the last-opened one */
+renderSaved();
+if (openPlaylistId && currentPlaylist()) {
+  if (currentPlaylist().channels) openPlaylist(openPlaylistId);
+  else { openPlaylistId = null; savePlaylists(); renderSaved(); }
+}
+
+/* ---------- settings ---------- */
+$('settings-btn').addEventListener('click', () => {
+  $('set-twitch-id').value = store.get('sh.twitch.id', '');
+  $('set-twitch-token').value = store.get('sh.twitch.token', '');
+  $('settings-modal').classList.add('open');
+});
+$('settings-close').addEventListener('click', () => $('settings-modal').classList.remove('open'));
+$('settings-modal').addEventListener('click', (e) => {
+  if (e.target === $('settings-modal')) $('settings-modal').classList.remove('open');
+});
+$('settings-save').addEventListener('click', () => {
+  store.set('sh.twitch.id', $('set-twitch-id').value.trim());
+  store.set('sh.twitch.token', $('set-twitch-token').value.trim());
+  $('settings-modal').classList.remove('open');
+  loadTwitchDirectory();
+});
+
+/* ---------- init ---------- */
+loadTwitchDirectory();
