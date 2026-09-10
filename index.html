@@ -115,10 +115,9 @@
     .player-header h3 { font-size: 1rem; font-weight: 700; flex: 1; min-width: 0;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .player-header .btn, .player-header .icon-btn { min-height: 44px; padding: 8px 14px; font-size: 0.85rem; }
-    .player-body { flex: 1; display: flex; min-height: 0; position: relative; }
+.player-body { flex: 1; display: flex; min-height: 0; position: relative; }
     .player-stage { flex: 1; min-width: 0; position: relative; background: #000; }
-    .player-stage iframe, .player-stage video { position: absolute; inset: 0;
-      width: 100%; height: 100%; border: 0; }
+    .player-stage iframe, .player-stage video, .player-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
     .player-chat { width: 340px; flex-shrink: 0; border-left: 1px solid var(--border);
       display: none; background: #05080f; }
     .player-chat.open { display: block; }
@@ -145,6 +144,7 @@
 
     .empty-state { text-align: center; padding: 48px 16px; color: var(--text-muted); }
     .empty-state p { margin-top: 10px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
     .playlist-item { padding: 14px 16px; background: var(--bg-card); border: 1px solid var(--border);
       border-radius: 10px; cursor: pointer; display: flex; align-items: center;
@@ -355,7 +355,7 @@
     </section>
   </main>
 
-  <footer>Tesla tip: open this page in the car browser → ⋯ menu → Add to Home Screen for a full-screen app icon.</footer>
+  <footer>Tesla tip: open this page in the car browser → ⋯ menu → Add to Home Screen for a full-screen app icon.<br>Passenger &amp; parked viewing only — drivers keep eyes on the road.</footer>
 
   <!-- PLAYER -->
   <div class="player-container" id="player-container">

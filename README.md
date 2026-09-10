@@ -3,6 +3,12 @@
 Watch **Twitch, YouTube and IPTV** in your Tesla browser (tested logic for 2023 Model 3).
 Black background, blue accent, touch-friendly, installable. Static site — deploy free via GitHub Pages.
 
+## Intended use — passenger & parked viewing only
+
+StreamHub is meant for **passengers and parked viewing**. Tesla pauses browser
+video in Drive; do not attempt to watch while driving. Drivers keep eyes on
+the road — use audio only when the car is moving.
+
 ## How the "Teslurk bypass" works (and what StreamHub copies)
 
 `twitch.tv` itself is a heavy app that struggles in the Tesla browser (Chromium/QtWebEngine).
@@ -32,7 +38,7 @@ Note: video plays while parked, like Teslurk — Tesla pauses browser video in D
 ## Use in the car (Model 3)
 
 1. Park, open the Tesla browser, go to your StreamHub URL.
-2. Twitch: type any channel name → **Watch**. 💬 toggles chat.
+2. Twitch: Teslurk-style browse — featured hero, **Top streams** row, **Browse categories** row (same 12 games), unified channel + game search. Tap a game tile to see its streams. Live titles/counts appear with free API keys in ⚙ Settings; without keys you get verified featured channels (never faked numbers). 💬 toggles chat.
 3. YouTube: paste any link/ID, or search.
 4. IPTV: **Add Playlist** — name it (`MLB`, `NBA`, `ESPN`…) + paste its M3U link.
    Each playlist becomes a tile. Tap a tile → channel windows with logos →

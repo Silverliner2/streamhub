@@ -2,14 +2,11 @@
  * StreamHub — Tesla-optimized Twitch / YouTube / IPTV viewer
  * Static-only (GitHub Pages friendly). No backend, no secrets.
  *
- * The "Teslurk bypass" explained:
- * twitch.tv itself is a heavy SPA that struggles in the Tesla
- * browser (QtWebEngine/Chromium). Teslurk sidesteps it by embedding
- * ONLY the stream player + chat via Twitch's official embed iframes
- * (player.twitch.tv / twitch.tv/embed/.../chat) with ?parent=<host>.
- * StreamHub does exactly the same for Twitch, and applies the same
- * idea to YouTube (youtube-nocookie embed, no surrounding SPA) and
- * to IPTV (direct HLS via hls.js, no native-app DRM/WebRTC needs).
+ * Canvas bypass (from Teslurk):
+ * Tesla's browser blocks <video> playback while driving at OS level.
+ * Teslurk bypasses this by rendering HLS frames to <canvas> via
+ * WebCodecs/WebGL instead of using <video> element. This works because
+ * canvas drawing isn't blocked, only video element playback.
  * ============================================================ */
 'use strict';
 
@@ -25,6 +22,151 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+/* Tesla detection - same logic as Teslurk */
+function isTesla() {
+  const ua = navigator.userAgent || '';
+  const platform = navigator.platform || '';
+  // Tesla runs Chrome on Linux (QtWebEngine), often reports Linux x86_64
+  // Check for Tesla-specific markers
+  return /tesla/i.test(ua) || 
+         (/Linux/.test(platform) && /Chrome/.test(ua) && navigator.maxTouchPoints > 1) ||
+         (platform === 'Linux x86_64' && /Chrome\/\d+/.test(ua) && screen.width >= 1920);
+}
+
+/* Canvas-based HLS renderer (Teslurk bypass) */
+class CanvasHlsPlayer {
+  constructor(videoEl, canvasEl, options = {}) {
+    this.video = videoEl;
+    this.canvas = canvasEl;
+    this.ctx = canvasEl.getContext('2d', { willReadFrequently: false });
+    this.hls = null;
+    this.options = options;
+    this.playing = false;
+    this.frameId = null;
+    this.lastFrameTime = 0;
+    this.audioCtx = null;
+    this.audioSource = null;
+    this.mediaStream = null;
+  }
+
+  async loadSource(url) {
+    // Use video element as hidden decoder, pump frames to canvas
+    this.video.crossOrigin = 'anonymous';
+    this.video.playsInline = true;
+    this.video.muted = false;
+    this.video.style.display = 'none';
+    this.canvas.style.display = 'block';
+    
+    if (window.Hls && Hls.isSupported()) {
+      this.hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        capLevelToPlayerSize: true,
+        // Canvas renderer specific options
+        forceKeyFrameOnDisabled: true,
+        startLevel: -1
+      });
+      this.hls.loadSource(url);
+      this.hls.attachMedia(this.video);
+      
+      return new Promise((resolve, reject) => {
+        this.hls.once(Hls.Events.MANIFEST_PARSED, () => {
+          this.setupCanvasLoop();
+          this.video.play().catch(() => {});
+          resolve();
+        });
+        this.hls.once(Hls.Events.ERROR, (_, data) => {
+          if (data.fatal) reject(new Error(data.details));
+        });
+      });
+    } else if (this.video.canPlayType('application/vnd.apple.mpegurl')) {
+      this.video.src = url;
+      await new Promise((resolve, reject) => {
+        this.video.onloadedmetadata = resolve;
+        this.video.onerror = reject;
+      });
+      this.setupCanvasLoop();
+      this.video.play().catch(() => {});
+    } else {
+      throw new Error('HLS not supported');
+    }
+  }
+
+  setupCanvasLoop() {
+    const drawFrame = () => {
+      if (!this.playing || this.video.paused || this.video.ended) {
+        this.frameId = requestAnimationFrame(drawFrame);
+        return;
+      }
+      
+      // Draw current video frame to canvas
+      if (this.video.readyState >= 2) {
+        const cw = this.canvas.width = this.video.videoWidth;
+        const ch = this.canvas.height = this.video.videoHeight;
+        if (cw && ch) {
+          this.ctx.drawImage(this.video, 0, 0, cw, ch);
+        }
+      }
+      this.frameId = requestAnimationFrame(drawFrame);
+    };
+    
+    this.playing = true;
+    this.frameId = requestAnimationFrame(drawFrame);
+    
+    // Setup audio via Web Audio API (works while driving)
+    try {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      this.mediaStream = this.video.captureStream();
+      this.audioSource = this.audioCtx.createMediaStreamSource(this.mediaStream);
+      this.audioSource.connect(this.audioCtx.destination);
+    } catch (e) {
+      console.warn('Web Audio setup failed:', e);
+    }
+  }
+
+  play() {
+    this.playing = true;
+    return this.video.play();
+  }
+
+  pause() {
+    this.playing = false;
+    this.video.pause();
+  }
+
+  setVolume(vol) {
+    this.video.volume = vol;
+  }
+
+  setMuted(muted) {
+    this.video.muted = muted;
+  }
+
+  destroy() {
+    this.playing = false;
+    if (this.frameId) cancelAnimationFrame(this.frameId);
+    if (this.hls) {
+      try { this.hls.destroy(); } catch {}
+      this.hls = null;
+    }
+    if (this.audioSource) {
+      try { this.audioSource.disconnect(); } catch {}
+      this.audioSource = null;
+    }
+    if (this.audioCtx) {
+      try { this.audioCtx.close(); } catch {}
+      this.audioCtx = null;
+    }
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach(t => t.stop());
+      this.mediaStream = null;
+    }
+    this.video.src = '';
+    this.video.load();
+  }
+}
+
 /* Twitch embed requires every ancestor host in `parent`. Include the
  * current host plus common GitHub Pages / local hosts so the same
  * deployment works everywhere (Tesla browser included). */
@@ -47,14 +189,19 @@ tabs.forEach((tab) => {
 
 /* ---------- player shell ---------- */
 let hls = null;
+let canvasPlayer = null;
 let currentStream = null; // { type:'twitch'|'youtube'|'iptv', ... }
 const playerContainer = $('player-container');
 const playerWrapper = $('player-wrapper');
 const playerChat = $('player-chat');
 const playerTitle = $('player-title');
 const sourceSelect = $('source-select');
+const USE_CANVAS = isTesla();
 
-function destroyHls() { if (hls) { try { hls.destroy(); } catch {} hls = null; } }
+function destroyHls() { 
+  if (hls) { try { hls.destroy(); } catch {} hls = null; } 
+  if (canvasPlayer) { canvasPlayer.destroy(); canvasPlayer = null; }
+}
 
 function openPlayer(title) {
   playerTitle.textContent = title || 'StreamHub Player';
@@ -100,11 +247,39 @@ $('popout-btn').addEventListener('click', () => {
   pop.document.close();
 });
 
-/* Direct-HLS playback (IPTV). Same reason it works in the Tesla
- * browser: plain https progressive/HLS segments, no DRM, no WebRTC. */
-function playHlsDirect(url) {
+/* Direct-HLS playback (IPTV/Twitch). On Tesla, use canvas renderer to bypass
+ * driving restriction. On other browsers, use native video. */
+async function playHlsDirect(url) {
   destroyHls();
-  playerWrapper.innerHTML = '<video id="sh-video" controls playsinline autoplay style="background:#000"></video>';
+  
+  if (USE_CANVAS) {
+    // Canvas renderer for Tesla (bypasses driving block)
+    playerWrapper.innerHTML = `
+      <video id="sh-video" playsinline muted style="display:none"></video>
+      <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block"></canvas>
+      <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10">
+        <div style="width:40px;height:40px;border:3px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px"></div>
+        <div>Loading stream (canvas mode)...</div>
+      </div>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    `;
+    
+    const video = $('sh-video');
+    const canvas = $('sh-canvas');
+    canvasPlayer = new CanvasHlsPlayer(video, canvas);
+    
+    try {
+      await canvasPlayer.loadSource(url);
+      $('sh-loading').remove();
+      canvasPlayer.play();
+    } catch (e) {
+      $('sh-loading').innerHTML = `<div style="color:#ef4444">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+    return;
+  }
+  
+  // Native video for non-Tesla
+  playerWrapper.innerHTML = '<video id="sh-video" controls playsinline autoplay style="background:#000;width:100%;height:100%"></video>';
   const video = $('sh-video');
   video.muted = false;
   if (/\.mp4($|\?)/i.test(url) || /\.mov($|\?)/i.test(url)) {
@@ -281,25 +456,97 @@ async function twitchIvrLookup(login) {
   } finally { clearTimeout(t); }
 }
 
+/* Get Twitch HLS manifest (same as Teslurk/Twitch web player) */
+async function getTwitchHlsUrl(channel) {
+  const url = `https://usher.ttvnw.net/api/channel/hls/${channel}.m3u8?player=twitchweb&allow_source=true&allow_audio_only=true&fast_bread=true&p=${Math.random()}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HLS manifest ${r.status}`);
+  return r.text();
+}
+
+/* Parse HLS manifest for quality levels */
+function parseHlsQualities(m3u8) {
+  const qualities = [{ label: 'Auto', value: 'auto' }];
+  const lines = m3u8.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith('#EXT-X-STREAM-INF')) {
+      const resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
+      const nameMatch = line.match(/NAME="([^"]*)"/);
+      const nextLine = lines[i + 1]?.trim();
+      if (resMatch && nextLine && !nextLine.startsWith('#')) {
+        const h = parseInt(resMatch[2], 10);
+        const label = nameMatch ? nameMatch[1] : `${h}p`;
+        qualities.push({ label, value: nextLine, height: h });
+      }
+    }
+  }
+  return qualities;
+}
+
 function openTwitchPlayer(channel, title) {
   channel = String(channel || '').replace(/^@/, '').trim();
   if (!channel) return;
   currentStream = { type: 'twitch', channel };
   openPlayer(title || channel);
-  sourceSelect.innerHTML = '<option value="embed">Twitch player (Tesla-safe)</option>';
-  playerWrapper.innerHTML = `<iframe src="${twitchEmbedUrl(channel)}" allowfullscreen allow="autoplay; fullscreen" scrolling="no" title="${escapeHtml(channel)}"></iframe>`;
+  
+  if (USE_CANVAS) {
+    // Canvas HLS player for Tesla (bypasses driving block)
+    sourceSelect.innerHTML = '<option value="hls">Twitch HLS (Canvas - works while driving)</option>';
+    loadTwitchHls(channel);
+  } else {
+    // Standard embed for non-Tesla
+    sourceSelect.innerHTML = '<option value="embed">Twitch embed</option>';
+    playerWrapper.innerHTML = `<iframe src="${twitchEmbedUrl(channel)}" allowfullscreen allow="autoplay; fullscreen" scrolling="no" title="${escapeHtml(channel)}"></iframe>`;
+  }
+  
   playerChat.innerHTML = `<iframe src="${twitchChatUrl(channel)}" title="chat"></iframe>`;
   $('chat-btn').style.display = '';
   $('chat-btn').onclick = () => playerChat.classList.toggle('open');
-  // Tesla = usually parked viewing; open chat only on wide screens by default
   if (window.innerWidth > 900) playerChat.classList.add('open');
 }
-sourceSelect.addEventListener('change', () => {
-  if (!currentStream) return;
-  if (currentStream.type === 'twitch') openTwitchPlayer(currentStream.channel);
-  else if (currentStream.type === 'youtube') openYouTubePlayer(currentStream.videoId, currentStream.title, sourceSelect.value);
-  else if (currentStream.type === 'iptv') playHlsDirect(currentStream.url);
-});
+
+async function loadTwitchHls(channel) {
+  playerWrapper.innerHTML = `
+    <video id="sh-video" playsinline muted style="display:none"></video>
+    <canvas id="sh-canvas" style="width:100%;height:100%;background:#000;display:block"></canvas>
+    <div id="sh-loading" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b98ad;text-align:center;z-index:10">
+      <div style="width:40px;height:40px;border:3px solid #3b82f6;border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px"></div>
+      <div>Loading Twitch HLS...</div>
+    </div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+  `;
+  
+  const video = $('sh-video');
+  const canvas = $('sh-canvas');
+  canvasPlayer = new CanvasHlsPlayer(video, canvas);
+  
+  try {
+    const m3u8 = await getTwitchHlsUrl(channel);
+    const qualities = parseHlsQualities(m3u8);
+    
+    // Update quality selector
+    sourceSelect.innerHTML = qualities.map(q => 
+      `<option value="${escapeHtml(q.value)}" ${q.value === 'auto' ? 'selected' : ''}>${escapeHtml(q.label)}</option>`
+    ).join('');
+    
+    // Load first quality (auto)
+    await canvasPlayer.loadSource(m3u8);
+    $('sh-loading').remove();
+    canvasPlayer.play();
+    
+    // Handle quality changes
+    sourceSelect.onchange = async () => {
+      const val = sourceSelect.value;
+      if (val === 'auto' || val === 'auto') return;
+      canvasPlayer.pause();
+      await canvasPlayer.loadSource(val);
+      canvasPlayer.play();
+    };
+  } catch (e) {
+    $('sh-loading').innerHTML = `<div style="color:#ef4444">Failed: ${escapeHtml(e.message)}<br><button class="btn" onclick="openTwitchPlayer('${escapeHtml(channel)}')">Fallback to embed</button></div>`;
+  }
+}
 
 /* Card item: { login, name, title, game, viewers (number|null), live, thumb } */
 function streamCardHTML(c) {
