@@ -199,6 +199,56 @@
     .ch-sheet .group { color: var(--accent); font-size: 0.85rem; font-weight: 700; margin-bottom: 16px; }
     .ch-sheet .btn { width: 100%; font-size: 1.1rem; padding: 16px; margin-bottom: 8px; }
 
+    /* Teslurk-style browse rows */
+    .row-head { display: flex; align-items: center; justify-content: space-between; margin: 22px 0 10px; }
+    .row-head h2 { font-size: 1.05rem; font-weight: 800; }
+    .link-btn { background: none; border: none; color: var(--text-muted); font-size: 0.85rem;
+      font-weight: 700; cursor: pointer; min-height: 44px; padding: 8px 4px 8px 12px; }
+    .link-btn:hover { color: var(--accent); }
+    .h-row { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px;
+      scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; }
+    .h-row.expanded { flex-wrap: wrap; overflow: visible; }
+    .h-row.expanded .stream-card { flex: 1 1 240px; }
+    .h-row.expanded .cat-card { flex: 1 1 120px; }
+    .stream-card { flex: 0 0 250px; scroll-snap-align: start; cursor: pointer; }
+    .stream-thumb { position: relative; aspect-ratio: 16/9; border-radius: 10px; overflow: hidden;
+      background: linear-gradient(140deg, #0d1526, #070d18); border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center; }
+    .stream-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .stream-thumb .fallback { font-size: 2rem; font-weight: 800; color: var(--accent); }
+    .stream-card:hover .stream-thumb { border-color: var(--accent); }
+    .views-pill { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,0.78);
+      padding: 3px 9px; border-radius: 6px; font-size: 0.7rem; font-weight: 800; }
+    .views-pill i { color: var(--danger); font-style: normal; margin-right: 4px; }
+    .stream-title { font-weight: 700; font-size: 0.88rem; margin-top: 8px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stream-name { font-size: 0.8rem; color: var(--text-muted); margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stream-game { font-size: 0.78rem; color: var(--accent); margin-top: 1px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cat-card { flex: 0 0 124px; scroll-snap-align: start; cursor: pointer; }
+    .cat-art { position: relative; aspect-ratio: 3/4; border-radius: 10px; overflow: hidden;
+      background: linear-gradient(160deg, #0d1526, #05080f); border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center; }
+    .cat-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .cat-art .fallback { font-size: 2.2rem; font-weight: 800; color: var(--accent); }
+    .cat-card:hover .cat-art { border-color: var(--accent); }
+    .cat-name { font-size: 0.78rem; font-weight: 700; margin-top: 6px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .hero-card { position: relative; border-radius: 14px; overflow: hidden; border: 1px solid var(--border);
+      cursor: pointer; aspect-ratio: 21/7; min-height: 190px; margin-top: 4px;
+      background: linear-gradient(120deg, #0d1526, #14203a 55%, #1a1440);
+      display: flex; align-items: flex-end; }
+    .hero-card > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .hero-fallback { position: absolute; left: 22px; bottom: 70px; font-size: 4rem;
+      font-weight: 800; color: var(--accent); opacity: 0.9; }
+    .hero-grad { position: absolute; inset: 0; background: linear-gradient(0deg, rgba(0,0,0,0.88), transparent 62%); }
+    .hero-meta { position: relative; padding: 16px 18px; }
+    .feat-tag { font-size: 0.65rem; font-weight: 800; letter-spacing: 0.08em; color: var(--text-muted); margin-left: 8px; }
+    .hero-name { font-size: 1.15rem; font-weight: 800; margin-top: 8px; }
+    .hero-sub { font-size: 0.85rem; color: var(--text-muted); margin-top: 2px; }
+    .hero-sub .hero-game { color: var(--accent); font-weight: 700; }
+
     footer { text-align: center; padding: 18px; color: var(--text-muted); font-size: 0.78rem;
       border-top: 1px solid var(--border); }
 
@@ -228,18 +278,28 @@
   <main>
     <!-- TWITCH -->
     <section id="twitch" class="section active">
-      <div class="hero">
-        <h1>Watch <em>Twitch</em> in your Tesla</h1>
-        <p>Type to search channels live — or enter an exact name to open it. No login needed.</p>
-      </div>
       <div class="search-bar">
-        <input type="text" id="twitch-search" placeholder="Channel name, e.g. shroud" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <button class="btn btn-primary" id="twitch-go">Watch</button>
+        <input type="text" id="twitch-search" placeholder="Search channels or games…" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button class="btn btn-primary" id="twitch-go">Search</button>
       </div>
-      <div class="chip-row" id="twitch-chips"></div>
-      <div class="hint" id="twitch-browse-hint" style="display:none"></div>
-      <div class="grid" id="twitch-grid"></div>
-      <div class="empty-state" id="twitch-empty" style="display:none"><p>No streams found.</p></div>
+      <div id="twitch-home">
+        <div id="twitch-featured"></div>
+        <div class="row-head"><h2>Top streams</h2><button class="link-btn" id="twitch-seeall-top">See all ›</button></div>
+        <div class="h-row" id="twitch-grid"></div>
+        <div class="row-head"><h2>Browse categories</h2><button class="link-btn" id="twitch-seeall-cats">See all ›</button></div>
+        <div class="h-row" id="twitch-cats"></div>
+        <div class="hint" id="twitch-browse-hint" style="display:none"></div>
+      </div>
+      <div id="twitch-results" style="display:none">
+        <button class="btn btn-secondary" id="twitch-back">‹ Back to browse</button>
+        <div id="twitch-res-cats-wrap" style="display:none">
+          <h2 class="row-title">Categories</h2>
+          <div class="h-row" id="twitch-res-cats"></div>
+        </div>
+        <h2 class="row-title" id="twitch-res-title">Channels</h2>
+        <div class="grid" id="twitch-results-grid"></div>
+        <div class="empty-state" id="twitch-empty" style="display:none"><p>No streams found.</p></div>
+      </div>
     </section>
 
     <!-- YOUTUBE -->

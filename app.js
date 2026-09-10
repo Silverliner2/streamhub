@@ -136,7 +136,45 @@ function playHlsDirect(url) {
 /* ============================================================
  * TWITCH — official embed (the Teslurk bypass)
  * ============================================================ */
-const TWITCH_FEATURED = ['shroud', 'ninja', 'xqc', 'pokimane', 'summit1g', 'tarik', 'shylily', 'ludwig', 'asmongold', 'ESL_CSGO', 'riotgames', 'hasanabi'];
+/* Same category lineup as Teslurk. Streamer logins are hand-verified
+ * real channels; tapping one opens it (embed shows offline if not live).
+ * No viewer numbers are ever faked — counts only appear with live data. */
+const TOP_CURATED = [
+  { login: 'xqc', game: 'Just Chatting' },
+  { login: 'shroud', game: 'Counter-Strike' },
+  { login: 'ninja', game: 'Fortnite' },
+  { login: 'tarik', game: 'VALORANT' },
+  { login: 'asmongold', game: 'World of Warcraft' },
+  { login: 'summit1g', game: 'Grand Theft Auto V' },
+  { login: 'pokimane', game: 'Just Chatting' },
+  { login: 'tyler1', game: 'League of Legends' },
+  { login: 'sodapoppin', game: 'World of Warcraft' },
+  { login: 'gorgc', game: 'Dota 2' },
+  { login: 'trainwreckstv', game: 'Slots' },
+  { login: 'rocketleague', game: 'Rocket League' },
+];
+const CATS = [
+  { name: 'Just Chatting', streamers: ['xqc', 'hasanabi', 'pokimane', 'ludwig'] },
+  { name: 'Grand Theft Auto V', streamers: ['xqc', 'summit1g', 'buddha', 'shroud'] },
+  { name: 'Counter-Strike', streamers: ['shroud', 'fl0m', 'ESL_CSGO'] },
+  { name: 'World of Warcraft', streamers: ['asmongold', 'sodapoppin', 'esfandtv'] },
+  { name: 'League of Legends', streamers: ['tyler1', 'riotgames', 'doublelift'] },
+  { name: 'Fortnite', streamers: ['ninja', 'tfue', 'sypherpk'] },
+  { name: 'VALORANT', streamers: ['tarik', 'tenz', 'shroud'] },
+  { name: 'Dota 2', streamers: ['gorgc', 'admiralbulldog', 'esl_dota2'] },
+  { name: 'Slots', streamers: ['trainwreckstv', 'roshtein', 'xposed'] },
+  { name: 'Rainbow Six Siege', streamers: ['maciejay', 'pengu', 'varsitygaming'] },
+  { name: 'How to Fish', streamers: [] },
+  { name: 'Rocket League', streamers: ['rocketleague', 'johnnyboi_i', 'lethamyr'] },
+];
+function twitchBoxArt(name) {
+  return `https://static-cdn.jtvnw.net/ttv-boxart/${encodeURIComponent(name)}-144x192.jpg`;
+}
+function formatViews(n) {
+  n = Number(n || 0);
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+  return String(n);
+}
 const TWITCH_API = 'https://api.twitch.tv/helix';
 
 function twitchEmbedUrl(channel) {
@@ -177,11 +215,32 @@ async function twitchGqlSearch(query) {
       login: u.login,
       name: u.displayName || u.login,
       live: !!u.stream,
-      thumb: u.profileImageURL || twitchThumb(u.login),
+      thumb: u.stream ? twitchThumb(u.login) : (u.profileImageURL || twitchThumb(u.login)),
       meta: u.stream
         ? `${((u.stream || {}).game || {}).displayName || 'Live'} • ${Number(u.stream.viewersCount || 0).toLocaleString()} watching`
         : `${Number((u.followers || {}).totalCount || 0).toLocaleString()} followers • tap to open`,
     }));
+  } finally { clearTimeout(t); }
+}
+
+async function twitchGqlGames(query) {
+  const body = {
+    query: 'query GameSearch($q: String!) { searchFor(query: $q, first: 8) { games { edges { item { __typename ... on Game { name boxArtURL(width: 144, height: 192) } } } } } }',
+    variables: { q: query },
+  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(TWITCH_GQL, {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'Client-ID': TWITCH_WEB_ID },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`game search ${r.status}`);
+    const j = await r.json();
+    const edges = ((((j || {}).data || {}).searchFor || {}).games || {}).edges || [];
+    return edges.map((e) => e.item).filter((g) => g && g.name)
+      .map((g) => ({ name: g.name, art: g.boxArtURL || twitchBoxArt(g.name) }));
   } finally { clearTimeout(t); }
 }
 
@@ -224,27 +283,79 @@ sourceSelect.addEventListener('change', () => {
   else if (currentStream.type === 'iptv') playHlsDirect(currentStream.url);
 });
 
-function renderTwitchList(items) {
-  const grid = $('twitch-grid');
-  const empty = $('twitch-empty');
-  if (!items.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
-  empty.style.display = 'none';
-  grid.innerHTML = items.map((c) => `
-    <div class="card" tabindex="0" data-login="${escapeHtml(c.login)}" data-name="${escapeHtml(c.name)}">
-      <div class="card-thumb">
-        <img loading="lazy" src="${escapeHtml(c.thumb)}" alt="${escapeHtml(c.name)}" onerror="this.style.display='none'">
-        ${c.live ? '<span class="live-badge">Live</span>' : ''}
+/* Card item: { login, name, title, game, viewers (number|null), live, thumb } */
+function streamCardHTML(c) {
+  const initial = escapeHtml((c.name || c.login || '?').trim().charAt(0).toUpperCase());
+  return `
+    <div class="stream-card" tabindex="0" data-login="${escapeHtml(c.login)}" data-name="${escapeHtml(c.name || c.login)}" data-title="${escapeHtml(c.title || c.name || c.login)}">
+      <div class="stream-thumb">
+        <span class="fallback">${initial}</span>
+        <img loading="lazy" src="${escapeHtml(c.thumb)}" alt="" onerror="this.remove()">
+        ${c.live ? '<span class="live-badge">LIVE</span>' : ''}
+        ${c.viewers != null ? `<span class="views-pill"><i>●</i>${escapeHtml(formatViews(c.viewers))}</span>` : ''}
       </div>
-      <div class="card-info">
-        <div class="card-title">${escapeHtml(c.name)}</div>
-        <div class="card-meta">${escapeHtml(c.meta || 'Tap to watch')}</div>
-      </div>
-    </div>`).join('');
-  grid.querySelectorAll('.card').forEach((card) => {
-    const go = () => openTwitchPlayer(card.dataset.login, card.dataset.name);
+      <div class="stream-title">${escapeHtml(c.title || c.name || c.login)}</div>
+      <div class="stream-name">${escapeHtml(c.name || c.login)}</div>
+      ${c.game ? `<div class="stream-game">${escapeHtml(c.game)}</div>` : ''}
+    </div>`;
+}
+function bindStreamCards(container) {
+  container.querySelectorAll('.stream-card').forEach((card) => {
+    const go = () => openTwitchPlayer(card.dataset.login, card.dataset.title);
     card.addEventListener('click', go);
     card.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
   });
+}
+function renderStreamCards(items, gridEl) {
+  gridEl.innerHTML = items.map(streamCardHTML).join('');
+  bindStreamCards(gridEl);
+}
+function catTileHTML(cat) {
+  const art = cat.art || twitchBoxArt(cat.name);
+  const initial = escapeHtml(cat.name.trim().charAt(0).toUpperCase());
+  return `
+    <div class="cat-card" tabindex="0" data-game="${escapeHtml(cat.name)}">
+      <div class="cat-art"><span class="fallback">${initial}</span><img loading="lazy" src="${escapeHtml(art)}" alt="" onerror="this.remove()"></div>
+      <div class="cat-name">${escapeHtml(cat.name)}</div>
+    </div>`;
+}
+function bindCatTiles(container, onPick) {
+  container.querySelectorAll('.cat-card').forEach((tile) => {
+    const go = () => onPick(tile.dataset.game);
+    tile.addEventListener('click', go);
+    tile.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+  });
+}
+function renderHero(item) {
+  const box = $('twitch-featured');
+  const initial = escapeHtml((item.name || item.login).trim().charAt(0).toUpperCase());
+  box.innerHTML = `
+    <div class="hero-card" tabindex="0" data-login="${escapeHtml(item.login)}">
+      <span class="hero-fallback">${initial}</span>
+      <img src="${escapeHtml(item.hero || item.thumb)}" alt="" onerror="this.remove()">
+      <div class="hero-grad"></div>
+      <div class="hero-meta">
+        ${item.live ? '<span class="live-badge">● LIVE</span>' : ''}<span class="feat-tag">FEATURED</span>
+        <div class="hero-name">${escapeHtml(item.name || item.login)}</div>
+        <div class="hero-sub"><span class="hero-game">${escapeHtml(item.game || 'Twitch')}</span>${item.viewers != null ? ` · ${escapeHtml(formatViews(item.viewers))} viewers` : ' · tap to watch'}</div>
+      </div>
+    </div>`;
+  const go = () => openTwitchPlayer(item.login, item.title || item.name || item.login);
+  const el = box.querySelector('.hero-card');
+  el.addEventListener('click', go);
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+}
+function showTwitchHome() {
+  $('twitch-results').style.display = 'none';
+  $('twitch-home').style.display = 'block';
+}
+function showTwitchResults(title) {
+  $('twitch-home').style.display = 'none';
+  $('twitch-results').style.display = 'block';
+  $('twitch-res-title').textContent = title || 'Channels';
+  $('twitch-res-cats-wrap').style.display = 'none';
+  $('twitch-results-grid').innerHTML = '';
+  $('twitch-empty').style.display = 'none';
 }
 
 /* Live directory via Helix — only when the user adds their own free
@@ -262,99 +373,159 @@ async function tryTwitchHelix(path) {
 }
 
 async function loadTwitchDirectory() {
+  showTwitchHome();
   const hint = $('twitch-browse-hint');
+  // Categories row is always available (static lineup + real box art).
+  const catsBox = $('twitch-cats');
+  catsBox.innerHTML = CATS.map(catTileHTML).join('');
+  bindCatTiles(catsBox, openCategory);
+
   try {
-    const [streams, games] = await Promise.all([
-      tryTwitchHelix('/streams?first=20'),
-      tryTwitchHelix('/games/top?first=8'),
-    ]);
-    if (streams && streams.data) {
+    const streams = await tryTwitchHelix('/streams?first=20');
+    if (streams && streams.data && streams.data.length) {
       hint.style.display = 'none';
-      renderTwitchList(streams.data.map((s) => ({
-        login: s.user_login, name: s.user_name, live: true,
-        thumb: (s.thumbnail_url || '').replace('{width}', '320').replace('{height}', '180'),
-        meta: `${s.game_name || ''} • ${Number(s.viewer_count || 0).toLocaleString()} viewers`,
-      })));
-      if (games && games.data) {
-        $('twitch-chips').innerHTML = games.data.map((g) => `<button class="chip" data-game="${escapeHtml(g.name)}">${escapeHtml(g.name)}</button>`).join('');
-        $('twitch-chips').querySelectorAll('.chip').forEach((ch) => ch.addEventListener('click', () => {
-          $('twitch-search').value = '';
-          searchTwitchGame(ch.dataset.game);
-        }));
-      }
+      const items = streams.data.map((s) => ({
+        login: s.user_login, name: s.user_name, title: s.title || s.user_name,
+        game: s.game_name || '', viewers: s.viewer_count, live: true,
+        thumb: (s.thumbnail_url || '').replace('{width}', '640').replace('{height}', '360'),
+        hero: (s.thumbnail_url || '').replace('{width}', '1280').replace('{height}', '720'),
+      }));
+      renderHero(items[0]);
+      renderStreamCards(items, $('twitch-grid'));
       return;
     }
-  } catch { /* fall through to featured */ }
+  } catch { /* fall through to curated */ }
   hint.style.display = 'block';
-  hint.innerHTML = '<strong>Featured channels</strong> (no login needed — tap any card). For a live directory + search, add a free Twitch Client-ID + token in ⚙ Settings.';
-  $('twitch-chips').innerHTML = '';
-  renderTwitchList(TWITCH_FEATURED.map((login) => ({
-    login, name: login, live: false, thumb: twitchThumb(login), meta: 'Tap to watch',
-  })));
+  hint.innerHTML = '<strong>Browse picks</strong> (no login needed — tap anything). Titles, live badges and viewer counts appear when you add a free Twitch Client-ID + token in ⚙ Settings.';
+  const items = TOP_CURATED.map((t) => ({
+    login: t.login, name: t.login, title: `Watch ${t.login}`, game: t.game,
+    viewers: null, live: false, thumb: twitchThumb(t.login),
+    hero: `https://static-cdn.jtvnw.net/previews-ttv/live_user_${encodeURIComponent(t.login.toLowerCase())}-1280x720.jpg`,
+  }));
+  renderHero(items[0]);
+  renderStreamCards(items, $('twitch-grid'));
 }
 
-async function searchTwitchGame(gameName) {
-  try {
-    const id = store.get('sh.twitch.id', ''), token = store.get('sh.twitch.token', '');
-    let g = await (await fetch(`${TWITCH_API}/games?name=${encodeURIComponent(gameName)}`, {
-      headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
-    })).json();
-    const gid = g.data && g.data[0] && g.data[0].id;
-    if (!gid) return;
-    const s = await (await fetch(`${TWITCH_API}/streams?game_id=${gid}&first=20`, {
-      headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
-    })).json();
-    renderTwitchList((s.data || []).map((x) => ({
-      login: x.user_login, name: x.user_name, live: true,
-      thumb: (x.thumbnail_url || '').replace('{width}', '320').replace('{height}', '180'),
-      meta: `${Number(x.viewer_count || 0).toLocaleString()} viewers`,
-    })));
-  } catch { /* ignore */ }
-}
+/* Search-by-game: tap a category tile (or a game from search results).
+ * Live streams when keys exist; otherwise the verified featured channels
+ * for that game. */
+async function openCategory(gameName) {
+  showTwitchResults(gameName);
+  const grid = $('twitch-results-grid');
+  grid.innerHTML = '<div class="hint">Loading streams…</div>';
 
-async function handleTwitchSearch() {
-  const q = $('twitch-search').value.trim().replace(/^@/, '');
-  if (!q) return loadTwitchDirectory();
-  $('twitch-empty').style.display = 'none';
-  $('twitch-grid').innerHTML = '<div class="hint">Searching…</div>';
-
-  // 1) Full Helix search when the user added free keys in Settings
   const id = store.get('sh.twitch.id', '');
   const token = store.get('sh.twitch.token', '');
   if (id && token) {
     try {
-      const r = await (await fetch(`${TWITCH_API}/search/channels?query=${encodeURIComponent(q)}&first=12`, {
+      const g = await (await fetch(`${TWITCH_API}/games?name=${encodeURIComponent(gameName)}`, {
         headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
       })).json();
-      if (r.data && r.data.length) {
-        renderTwitchList(r.data.map((c) => ({
-          login: c.broadcaster_login, name: c.display_name,
-          live: c.is_live, thumb: c.thumbnail_url || twitchThumb(c.broadcaster_login),
-          meta: c.is_live ? `${c.game_name || 'Live'} • live` : 'Offline — tap to open channel',
-        })));
-        return;
+      const gid = g.data && g.data[0] && g.data[0].id;
+      if (gid) {
+        const s = await (await fetch(`${TWITCH_API}/streams?game_id=${gid}&first=20`, {
+          headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+        })).json();
+        const items = (s.data || []).map((x) => ({
+          login: x.user_login, name: x.user_name, title: x.title || x.user_name,
+          game: x.game_name || gameName, viewers: x.viewer_count, live: true,
+          thumb: (x.thumbnail_url || '').replace('{width}', '640').replace('{height}', '360'),
+        }));
+        if (items.length) { renderStreamCards(items, grid); return; }
       }
+    } catch { /* fall through to curated */ }
+  }
+
+  const cat = CATS.find((c) => c.name.toLowerCase() === String(gameName).toLowerCase());
+  const logins = cat ? cat.streamers : [];
+  if (!logins.length) {
+    grid.innerHTML = `<div class="hint">No offline picks for <strong>${escapeHtml(gameName)}</strong> — add a free Twitch Client-ID + token in ⚙ Settings for live streams in every game.</div>`;
+    return;
+  }
+  renderStreamCards(logins.map((login) => ({
+    login, name: login, title: `Watch ${login}`, game: gameName,
+    viewers: null, live: false, thumb: twitchThumb(login),
+  })), grid);
+}
+
+async function handleTwitchSearch() {
+  const q = $('twitch-search').value.trim().replace(/^@/, '');
+  if (!q) { loadTwitchDirectory(); return; }
+  showTwitchResults(`Results for “${q}”`);
+  const grid = $('twitch-results-grid');
+  grid.innerHTML = '<div class="hint">Searching…</div>';
+
+  const id = store.get('sh.twitch.id', '');
+  const token = store.get('sh.twitch.token', '');
+  if (id && token) {
+    try {
+      const [ch, gm] = await Promise.all([
+        (await fetch(`${TWITCH_API}/search/channels?query=${encodeURIComponent(q)}&first=12`, {
+          headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+        })).json(),
+        (await fetch(`${TWITCH_API}/search/categories?query=${encodeURIComponent(q)}&first=8`, {
+          headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+        })).json(),
+      ]);
+      const games = (gm.data || []).map((g) => ({ name: g.name, art: g.boxart_url ? g.boxart_url.replace('{width}', '144').replace('{height}', '192') : twitchBoxArt(g.name) }));
+      if (games.length) {
+        $('twitch-res-cats-wrap').style.display = 'block';
+        const box = $('twitch-res-cats');
+        box.innerHTML = games.map(catTileHTML).join('');
+        bindCatTiles(box, openCategory);
+      }
+      const items = (ch.data || []).map((c) => ({
+        login: c.broadcaster_login, name: c.display_name, title: c.title || c.display_name,
+        game: c.game_name || '', live: c.is_live, viewers: null,
+        thumb: c.is_live ? twitchThumb(c.broadcaster_login) : (c.thumbnail_url || twitchThumb(c.broadcaster_login)),
+      }));
+      if (items.length) { renderStreamCards(items, grid); return; }
+      if (games.length) { grid.innerHTML = ''; return; }
     } catch { /* fall through to keyless */ }
   }
 
-  // 2) Keyless anonymous search
-  try {
-    const res = await twitchGqlSearch(q);
-    if (res.length) { renderTwitchList(res); return; }
-  } catch { /* fall through */ }
-
-  // 3) Exact channel lookup (keyless), 4) just open the name
-  if (/^[A-Za-z0-9_]{2,25}$/.test(q)) {
-    try { renderTwitchList([await twitchIvrLookup(q)]); return; }
-    catch { openTwitchPlayer(q, q); return; }
+  // Keyless: anonymous channel + game search, plus local category match
+  // (so game names work even with zero network APIs).
+  let channels = [];
+  try { channels = await twitchGqlSearch(q); } catch { channels = []; }
+  let games = [];
+  try { games = await twitchGqlGames(q); } catch { games = []; }
+  const local = CATS.filter((c) => c.name.toLowerCase().includes(q.toLowerCase()))
+    .filter((c) => !games.some((g) => g.name.toLowerCase() === c.name.toLowerCase()))
+    .map((c) => ({ name: c.name }));
+  games = games.concat(local);
+  if (games.length) {
+    $('twitch-res-cats-wrap').style.display = 'block';
+    const box = $('twitch-res-cats');
+    box.innerHTML = games.map(catTileHTML).join('');
+    bindCatTiles(box, openCategory);
   }
-  renderTwitchList([]);
+  if (channels.length) { renderStreamCards(channels, grid); return; }
+  if (games.length) { grid.innerHTML = ''; return; }
+
+  if (/^[A-Za-z0-9_]{2,25}$/.test(q)) {
+    try {
+      const one = await twitchIvrLookup(q);
+      renderStreamCards([{ ...one, title: `Watch ${one.login}`, game: '' }], grid);
+      return;
+    } catch { openTwitchPlayer(q, q); return; }
+  }
+  grid.innerHTML = '';
+  $('twitch-empty').style.display = 'block';
 }
 $('twitch-go').addEventListener('click', handleTwitchSearch);
 $('twitch-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleTwitchSearch(); });
 $('twitch-search').addEventListener('input', debounce(() => {
-  if ($('twitch-search').value.trim().length >= 2) handleTwitchSearch();
+  const v = $('twitch-search').value.trim();
+  if (v.length >= 2) handleTwitchSearch();
+  else if (!v) loadTwitchDirectory();
 }, 600));
+$('twitch-back').addEventListener('click', () => {
+  $('twitch-search').value = '';
+  loadTwitchDirectory();
+});
+$('twitch-seeall-top').addEventListener('click', () => $('twitch-grid').classList.toggle('expanded'));
+$('twitch-seeall-cats').addEventListener('click', () => $('twitch-cats').classList.toggle('expanded'));
 
 /* ============================================================
  * YOUTUBE — privacy embed (same bypass idea as Twitch)
