@@ -120,7 +120,8 @@ function playHlsDirect(url) {
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (!data || !data.fatal) return;
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-        playerWrapper.innerHTML = `<div style="display:flex;height:100%;align-items:center;justify-content:center;text-align:center;padding:24px;color:#8b98ad">Stream blocked by CORS or offline.<br>Tip: many IPTV hosts need a proxy or an Xtream login.</div>`;
+        const mixed = /^http:\/\//i.test(url) && window.location.protocol === 'https:';
+        playerWrapper.innerHTML = `<div style="display:flex;height:100%;align-items:center;justify-content:center;text-align:center;padding:24px;color:#8b98ad">${mixed ? 'This stream is plain-http and browsers refuse to play it on a secure page.<br>Ask your provider for an https link.' : 'Stream blocked by CORS or offline.<br>Tip: Xtream logins and https hosts usually work.'}</div>`;
       }
       destroyHls();
     });
@@ -451,10 +452,46 @@ function currentPlaylist() {
   return iptvPlaylists.find((p) => p.id === openPlaylistId) || null;
 }
 
+async function fetchText(url, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.text();
+  } finally { clearTimeout(t); }
+}
+
+/* Browsers (Tesla included) block two things native apps like StrymTV
+ * don't care about: cross-origin (CORS) reads and plain-http requests
+ * from a secure page. So: try direct first, then https proxies which
+ * fix both problems for the playlist download. */
+const CORS_PROXIES = [
+  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+];
+
+async function loadM3UFromUrl(url) {
+  try { return await fetchText(url); } catch { /* try proxies */ }
+  for (const wrap of CORS_PROXIES) {
+    try {
+      const text = await fetchText(wrap(url));
+      if (text && /#EXTM3U/i.test(text)) return text;
+    } catch { /* next */ }
+  }
+  if (/^http:\/\//i.test(url) && window.location.protocol === 'https:') {
+    throw new Error('That link is plain-http and every route to it failed. Ask your provider for an https playlist link, or an Xtream login on an https host.');
+  }
+  throw new Error('No route to that link worked (direct + 2 fallbacks failed). The host may be offline or blocking all web access.');
+}
+
 async function fetchPlaylistChannels(pl) {
   const text = await loadM3UFromUrl(pl.url);
+  if (!/#EXTM3U/i.test(text)) {
+    throw new Error('That address returned a web page, not a playlist. Paste the FULL M3U link from your provider — it usually ends with .m3u or contains "get.php?username=" — not just the homepage.');
+  }
   const chans = parseM3U(text);
-  if (!chans.length) throw new Error('No channels found in that playlist.');
+  if (!chans.length) throw new Error('That playlist contained no playable channels.');
   return chans;
 }
 
@@ -615,12 +652,6 @@ function parseM3U(text) {
     }
   }
   return out;
-}
-
-async function loadM3UFromUrl(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.text();
 }
 
 $('iptv-add').addEventListener('click', handleAddPlaylist);
