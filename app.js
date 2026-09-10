@@ -149,6 +149,61 @@ function twitchThumb(userLogin) {
   return `https://static-cdn.jtvnw.net/previews-ttv/live_user_${encodeURIComponent(userLogin.toLowerCase())}-320x180.jpg`;
 }
 
+/* Keyless Twitch search, layered like the YouTube tab:
+ * 1) Helix (only if the user added free keys in Settings),
+ * 2) anonymous web search (same public endpoint twitch.tv itself uses),
+ * 3) exact channel lookup via the public IVR.fi API (verified keyless),
+ * 4) last resort: just open it as a channel name. */
+const TWITCH_GQL = 'https://gql.twitch.tv/gql';
+const TWITCH_WEB_ID = 'kimne78kx3ncx6brgo4vl6wkyfabb';
+
+async function twitchGqlSearch(query) {
+  const body = {
+    query: 'query Search($q: String!) { searchFor(query: $q, first: 12) { channels { edges { item { __typename ... on User { login displayName description profileImageURL(width: 300) followers { totalCount } stream { title viewersCount game { displayName } } } } } } } }',
+    variables: { q: query },
+  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(TWITCH_GQL, {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'Client-ID': TWITCH_WEB_ID },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(`search ${r.status}`);
+    const j = await r.json();
+    const edges = ((((j || {}).data || {}).searchFor || {}).channels || {}).edges || [];
+    return edges.map((e) => e.item).filter((u) => u && u.login).map((u) => ({
+      login: u.login,
+      name: u.displayName || u.login,
+      live: !!u.stream,
+      thumb: u.profileImageURL || twitchThumb(u.login),
+      meta: u.stream
+        ? `${((u.stream || {}).game || {}).displayName || 'Live'} • ${Number(u.stream.viewersCount || 0).toLocaleString()} watching`
+        : `${Number((u.followers || {}).totalCount || 0).toLocaleString()} followers • tap to open`,
+    }));
+  } finally { clearTimeout(t); }
+}
+
+async function twitchIvrLookup(login) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${encodeURIComponent(login)}`, { signal: ctrl.signal });
+    if (!r.ok) throw new Error('lookup failed');
+    const j = await r.json();
+    const u = Array.isArray(j) ? j[0] : j;
+    if (!u || !u.login) throw new Error('not found');
+    return {
+      login: u.login,
+      name: u.displayName || u.login,
+      live: false,
+      thumb: u.logo || twitchThumb(u.login),
+      meta: u.followers ? `${Number(u.followers).toLocaleString()} followers • tap to open` : 'Tap to open channel',
+    };
+  } finally { clearTimeout(t); }
+}
+
 function openTwitchPlayer(channel, title) {
   channel = String(channel || '').replace(/^@/, '').trim();
   if (!channel) return;
@@ -260,29 +315,46 @@ async function searchTwitchGame(gameName) {
 async function handleTwitchSearch() {
   const q = $('twitch-search').value.trim().replace(/^@/, '');
   if (!q) return loadTwitchDirectory();
-  // If it looks like a channel name, just play it (works with zero API).
-  if (/^[A-Za-z0-9_]{2,25}$/.test(q)) {
-    const id = store.get('sh.twitch.id', ''), token = store.get('sh.twitch.token', '');
-    if (id && token) {
-      try {
-        const r = await (await fetch(`${TWITCH_API}/search/channels?query=${encodeURIComponent(q)}&first=10`, {
-          headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
-        })).json();
-        if (r.data && r.data.length) {
-          renderTwitchList(r.data.map((c) => ({
-            login: c.broadcaster_login, name: c.display_name,
-            live: c.is_live, thumb: c.thumbnail_url || twitchThumb(c.broadcaster_login),
-            meta: c.is_live ? `${c.game_name || ''} • live` : 'Offline — tap to open channel',
-          })));
-          return;
-        }
-      } catch { /* fall through */ }
-    }
-    openTwitchPlayer(q, q);
+  $('twitch-empty').style.display = 'none';
+  $('twitch-grid').innerHTML = '<div class="hint">Searching…</div>';
+
+  // 1) Full Helix search when the user added free keys in Settings
+  const id = store.get('sh.twitch.id', '');
+  const token = store.get('sh.twitch.token', '');
+  if (id && token) {
+    try {
+      const r = await (await fetch(`${TWITCH_API}/search/channels?query=${encodeURIComponent(q)}&first=12`, {
+        headers: { 'Client-ID': id, Authorization: `Bearer ${token.replace(/^oauth:/, '')}` },
+      })).json();
+      if (r.data && r.data.length) {
+        renderTwitchList(r.data.map((c) => ({
+          login: c.broadcaster_login, name: c.display_name,
+          live: c.is_live, thumb: c.thumbnail_url || twitchThumb(c.broadcaster_login),
+          meta: c.is_live ? `${c.game_name || 'Live'} • live` : 'Offline — tap to open channel',
+        })));
+        return;
+      }
+    } catch { /* fall through to keyless */ }
   }
+
+  // 2) Keyless anonymous search
+  try {
+    const res = await twitchGqlSearch(q);
+    if (res.length) { renderTwitchList(res); return; }
+  } catch { /* fall through */ }
+
+  // 3) Exact channel lookup (keyless), 4) just open the name
+  if (/^[A-Za-z0-9_]{2,25}$/.test(q)) {
+    try { renderTwitchList([await twitchIvrLookup(q)]); return; }
+    catch { openTwitchPlayer(q, q); return; }
+  }
+  renderTwitchList([]);
 }
 $('twitch-go').addEventListener('click', handleTwitchSearch);
 $('twitch-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') handleTwitchSearch(); });
+$('twitch-search').addEventListener('input', debounce(() => {
+  if ($('twitch-search').value.trim().length >= 2) handleTwitchSearch();
+}, 600));
 
 /* ============================================================
  * YOUTUBE — privacy embed (same bypass idea as Twitch)
